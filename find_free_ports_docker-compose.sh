@@ -9,7 +9,6 @@ declare -a CHANGES=()
 declare -a FINAL_PORTS=()
 declare -a OUTPUT_FILES=()
 
-RUN_ID="$(date +%Y%m%d%H%M%S)"
 RANGE_START=0
 RANGE_END=0
 BIND_PREFIX=""
@@ -19,7 +18,7 @@ PROTOCOL_SUFFIX=""
 
 usage() {
   cat <<'EOF'
-Usage: ./update_docker-compose_ports.sh [compose-file ...]
+Usage: ./find_free_ports_docker-compose.sh [compose-file ...]
 
 Scans Docker Compose files for published host ports that are already in use on the
 machine, creates new Compose files with conflicting host ports rewritten to the
@@ -32,7 +31,7 @@ If no files are passed, the script checks these files when present:
   - compose.override.yml
 
 Generated files are written next to the originals with a .resolved suffix.
-If that path already exists, a timestamped filename is used instead.
+Existing .resolved files are overwritten on each run.
 EOF
 }
 
@@ -66,6 +65,19 @@ reserve_port_spec() {
   parse_port_range "$spec"
   for ((port = RANGE_START; port <= RANGE_END; port++)); do
     RESERVED_PORTS["$port"]=1
+  done
+}
+
+mark_used_port_spec() {
+  local spec="$1"
+  local port
+
+  if ! parse_port_range "$spec"; then
+    return 1
+  fi
+
+  for ((port = RANGE_START; port <= RANGE_END; port++)); do
+    USED_PORTS["$port"]=1
   done
 }
 
@@ -148,18 +160,24 @@ extract_host_port_parts() {
 load_used_ports() {
   local address
   local port
+  local ports_line
+  local raw_entry
+  local entry
+  local host_binding
+  local host_port_spec
+  local found_local_probe=0
+  local -a entries=()
 
   if command -v ss >/dev/null 2>&1; then
+    found_local_probe=1
     while IFS= read -r address; do
       [[ -z "$address" ]] && continue
       port="${address##*:}"
       [[ $port =~ ^[0-9]+$ ]] || continue
       USED_PORTS["$port"]=1
     done < <(ss -Hltnu | awk '{print $(NF-1)}')
-    return 0
-  fi
-
-  if command -v lsof >/dev/null 2>&1; then
+  elif command -v lsof >/dev/null 2>&1; then
+    found_local_probe=1
     while IFS= read -r port; do
       [[ $port =~ ^[0-9]+$ ]] || continue
       USED_PORTS["$port"]=1
@@ -167,11 +185,34 @@ load_used_ports() {
       lsof -nP -iTCP -sTCP:LISTEN -iUDP 2>/dev/null |
         awk 'NR > 1 {split($9, parts, ":"); port = parts[length(parts)]; if (port ~ /^[0-9]+$/) print port}'
     )
-    return 0
   fi
 
-  echo "Unable to inspect listening ports: install ss or lsof." >&2
-  exit 1
+  if (( found_local_probe == 0 )); then
+    echo "Unable to inspect listening ports: install ss or lsof." >&2
+    exit 1
+  fi
+
+  # Docker may publish ports via kernel NAT without a local listening socket,
+  # so include host ports from running containers as occupied too.
+  if command -v docker >/dev/null 2>&1; then
+    while IFS= read -r ports_line; do
+      [[ -z "$ports_line" ]] && continue
+      IFS=',' read -r -a entries <<< "$ports_line"
+
+      for raw_entry in "${entries[@]}"; do
+        entry="${raw_entry#"${raw_entry%%[![:space:]]*}"}"
+        entry="${entry%"${entry##*[![:space:]]}"}"
+
+        [[ $entry == *"->"* ]] || continue
+        host_binding="${entry%%->*}"
+
+        if [[ $host_binding =~ :([0-9]+(-[0-9]+)?)$ ]]; then
+          host_port_spec="${BASH_REMATCH[1]}"
+          mark_used_port_spec "$host_port_spec" || true
+        fi
+      done
+    done < <(docker ps --format '{{.Ports}}' 2>/dev/null || true)
+  fi
 }
 
 collect_default_files() {
@@ -190,8 +231,6 @@ build_output_file_path() {
   local base_name
   local stem
   local extension
-  local candidate
-  local counter=1
 
   if [[ $file == */* ]]; then
     directory="${file%/*}"
@@ -208,19 +247,7 @@ build_output_file_path() {
     extension=""
   fi
 
-  candidate="${directory}/${stem}.resolved${extension}"
-  if [[ ! -e $candidate ]]; then
-    printf '%s\n' "$candidate"
-    return 0
-  fi
-
-  candidate="${directory}/${stem}.resolved.${RUN_ID}${extension}"
-  while [[ -e $candidate ]]; do
-    candidate="${directory}/${stem}.resolved.${RUN_ID}.${counter}${extension}"
-    counter=$((counter + 1))
-  done
-
-  printf '%s\n' "$candidate"
+  printf '%s\n' "${directory}/${stem}.resolved${extension}"
 }
 
 process_file() {
