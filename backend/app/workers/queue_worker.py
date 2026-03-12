@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 
 import docker
@@ -57,6 +58,44 @@ def _candidate_base_urls(instance: VllmInstance) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
+def _decode_job_body(job: dict) -> bytes:
+    body_b64 = job.get("body_b64")
+    if isinstance(body_b64, str) and body_b64:
+        try:
+            return base64.b64decode(body_b64)
+        except Exception:
+            pass
+
+    # Backward compatibility with older queued jobs.
+    legacy_body = job.get("body", "")
+    if isinstance(legacy_body, bytes):
+        return legacy_body
+    if isinstance(legacy_body, str):
+        return legacy_body.encode("utf-8")
+    return b""
+
+
+def _strip_stream_from_json_body(body: bytes, content_type: str) -> bytes:
+    if not body:
+        return body
+
+    lowered_content_type = (content_type or "").lower()
+    should_try_json = "application/json" in lowered_content_type or body.lstrip().startswith((b"{", b"["))
+    if not should_try_json:
+        return body
+
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except Exception:
+        return body
+
+    if not isinstance(parsed, dict):
+        return body
+
+    parsed.pop("stream", None)
+    return json.dumps(parsed).encode("utf-8")
+
+
 async def _process_instance(instance: VllmInstance, redis: aioredis.Redis) -> None:
     base_urls = _candidate_base_urls(instance)
     batch = await dequeue_batch(
@@ -74,8 +113,8 @@ async def _process_instance(instance: VllmInstance, redis: aioredis.Redis) -> No
             method = job.get("method", "POST")
             path = str(job.get("path", "chat/completions")).lstrip("/")
             query = str(job.get("query", ""))
-            body = job.get("body", "")
             inbound_headers = job.get("headers", {}) or {}
+            body = _decode_job_body(job)
             headers = {
                 k: v
                 for k, v in inbound_headers.items()
@@ -86,12 +125,7 @@ async def _process_instance(instance: VllmInstance, redis: aioredis.Redis) -> No
             # complete JSON response that can be published to Redis. The proxy
             # re-wraps the result as SSE for clients that originally requested
             # streaming.
-            try:
-                parsed_body = json.loads(body) if body else {}
-                parsed_body.pop("stream", None)
-                body = json.dumps(parsed_body)
-            except Exception:
-                pass  # non-JSON body — forward as-is
+            body = _strip_stream_from_json_body(body, headers.get("content-type", ""))
 
             url = f"/v1/{path}"
             if query:
@@ -108,7 +142,7 @@ async def _process_instance(instance: VllmInstance, redis: aioredis.Redis) -> No
                                 method,
                                 url,
                                 headers=headers,
-                                content=body.encode("utf-8") if isinstance(body, str) else body,
+                                content=body,
                             )
                             break
                         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:

@@ -11,6 +11,9 @@ export interface GpuInfo {
 
 export interface GpuSummary {
   gpus: GpuInfo[]
+  system_memory_total_mb: number | null
+  system_memory_used_mb: number | null
+  system_memory_free_mb: number | null
 }
 
 export interface InstanceMetrics {
@@ -25,11 +28,15 @@ export interface InstanceMetrics {
   queue_depth: number
   requests_total_1h: number
   avg_context_length: number | null
+  system_memory_used_mb: number | null
+  system_memory_total_mb: number | null
 }
 
 export interface MetricsSummary {
   instances: InstanceMetrics[]
   total_requests_1h: number
+  total_instance_gpu_memory_used_mb: number
+  total_instance_system_memory_used_mb: number
 }
 
 export interface ContextLengthSuggestion {

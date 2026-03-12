@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import time
 import uuid
@@ -73,11 +74,14 @@ async def proxy(
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
 
     body = await request.body()
+    content_type = request.headers.get("content-type", "")
 
-    try:
-        payload = json.loads(body) if body else {}
-    except Exception:
-        payload = {}
+    payload = {}
+    if "application/json" in content_type.lower():
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception:
+            payload = {}
 
     # Validate model scope if the token restricts which models can be called.
     requested_model: str | None = payload.get("model")
@@ -108,7 +112,8 @@ async def proxy(
         "path": path,
         "query": str(request.query_params),
         "headers": dict(request.headers),
-        "body": body.decode("utf-8", errors="replace"),
+        # Encode bytes to preserve multimodal payloads (JSON, form-data, files).
+        "body_b64": base64.b64encode(body).decode("ascii"),
         "queue_priority_role": request_user.queue_priority_role,
         "stream": is_stream,
     }, redis)

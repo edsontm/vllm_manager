@@ -16,6 +16,9 @@ class GpuInfo(BaseModel):
 
 class GpuSummary(BaseModel):
     gpus: list[GpuInfo]
+    system_memory_total_mb: float | None = None
+    system_memory_used_mb: float | None = None
+    system_memory_free_mb: float | None = None
 
 
 class InstanceMetrics(BaseModel):
@@ -30,11 +33,15 @@ class InstanceMetrics(BaseModel):
     queue_depth: int = 0
     requests_total_1h: int = 0
     avg_context_length: float | None = None
+    system_memory_used_mb: float | None = None
+    system_memory_total_mb: float | None = None
 
 
 class MetricsSummary(BaseModel):
     instances: list[InstanceMetrics]
     total_requests_1h: int
+    total_instance_gpu_memory_used_mb: float = 0
+    total_instance_system_memory_used_mb: float = 0
 
 
 class ContextLengthSuggestion(BaseModel):

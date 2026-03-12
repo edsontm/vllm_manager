@@ -69,33 +69,283 @@ def _get_api() -> HfApi:
     return _hf_api
 
 
-async def list_models(query: str = "", limit: int = 20, sort: str = "downloads") -> list[HFModelInfo]:
+def _sibling_names(info: object) -> set[str]:
+    siblings = getattr(info, "siblings", None) or []
+    names = {
+        str(getattr(s, "rfilename", ""))
+        for s in siblings
+        if str(getattr(s, "rfilename", ""))
+    }
+    return names
+
+
+def _has_tokenizer_files(names: set[str]) -> bool:
+    tokenizer_markers = (
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json",
+        "spiece.model",
+        "vocab.json",
+        "merges.txt",
+    )
+    lowered = {n.lower() for n in names}
+    return any(any(n.endswith(marker) for marker in tokenizer_markers) for n in lowered)
+
+
+# Architectures supported by vLLM (extracted from vllm.model_executor.models.registry)
+_VLLM_SUPPORTED_ARCHITECTURES: frozenset[str] = frozenset({
+    "AfmoeForCausalLM", "ApertusForCausalLM", "AquilaForCausalLM", "AquilaModel",
+    "ArceeForCausalLM", "ArcticForCausalLM", "BaiChuanForCausalLM", "BaichuanForCausalLM",
+    "BailingMoeForCausalLM", "BailingMoeV2ForCausalLM", "BambaForCausalLM",
+    "BertForSequenceClassification", "BertForTokenClassification", "BertModel",
+    "BertSpladeSparseEmbeddingModel", "BgeM3EmbeddingModel", "BloomForCausalLM",
+    "CLIPModel", "ChatGLMForConditionalGeneration", "ChatGLMModel",
+    "Cohere2ForCausalLM", "CohereForCausalLM", "CwmForCausalLM", "DbrxForCausalLM",
+    "DeciLMForCausalLM", "DeepseekForCausalLM", "DeepseekV2ForCausalLM",
+    "DeepseekV32ForCausalLM", "DeepseekV3ForCausalLM", "Dots1ForCausalLM",
+    "Ernie4_5ForCausalLM", "Ernie4_5_MoeForCausalLM", "Exaone4ForCausalLM",
+    "ExaoneForCausalLM", "ExaoneMoEForCausalLM", "Fairseq2LlamaForCausalLM",
+    "FalconForCausalLM", "FalconH1ForCausalLM", "FalconMambaForCausalLM",
+    "FlexOlmoForCausalLM", "GPT2ForSequenceClassification", "GPT2LMHeadModel",
+    "GPTBigCodeForCausalLM", "GPTJForCausalLM", "GPTNeoXForCausalLM",
+    "Gemma2ForCausalLM", "Gemma2Model", "Gemma3ForCausalLM", "Gemma3TextModel",
+    "Gemma3nForCausalLM", "GemmaForCausalLM", "Glm4ForCausalLM", "Glm4MoeForCausalLM",
+    "Glm4MoeLiteForCausalLM", "GlmForCausalLM", "GlmMoeDsaForCausalLM",
+    "GptOssForCausalLM", "GraniteForCausalLM", "GraniteMoeForCausalLM",
+    "GraniteMoeHybridForCausalLM", "GraniteMoeSharedForCausalLM", "GritLM",
+    "Grok1ForCausalLM", "Grok1ModelForCausalLM", "GteModel",
+    "GteNewForSequenceClassification", "GteNewModel", "HCXVisionForCausalLM",
+    "HF_ColBERT", "HunYuanDenseV1ForCausalLM", "HunYuanMoEV1ForCausalLM",
+    "IQuestCoderForCausalLM", "IQuestLoopCoderForCausalLM", "InternLM2ForCausalLM",
+    "InternLM2ForRewardModel", "InternLM2VEForCausalLM", "InternLM3ForCausalLM",
+    "InternLMForCausalLM", "JAISLMHeadModel", "Jais2ForCausalLM",
+    "JambaForCausalLM", "JambaForSequenceClassification", "JinaVLForRanking",
+    "KimiLinearForCausalLM", "LLaMAForCausalLM", "Lfm2ForCausalLM",
+    "Lfm2MoeForCausalLM", "Llama4ForCausalLM",
+    "LlamaBidirectionalForSequenceClassification", "LlamaBidirectionalModel",
+    "LlamaForCausalLM", "LlamaModel", "LlavaNextForConditionalGeneration",
+    "LongcatFlashForCausalLM", "MPTForCausalLM", "Mamba2ForCausalLM",
+    "MambaForCausalLM", "MiMoForCausalLM", "MiMoV2FlashForCausalLM",
+    "MiniCPM3ForCausalLM", "MiniCPMForCausalLM", "MiniMaxForCausalLM",
+    "MiniMaxM1ForCausalLM", "MiniMaxM2ForCausalLM", "MiniMaxText01ForCausalLM",
+    "MistralForCausalLM", "MistralLarge3ForCausalLM", "MistralModel",
+    "MixtralForCausalLM", "ModernBertForSequenceClassification",
+    "ModernBertForTokenClassification", "ModernBertModel", "MptForCausalLM",
+    "NemotronForCausalLM", "NemotronHForCausalLM", "NemotronHPuzzleForCausalLM",
+    "NomicBertModel", "OPTForCausalLM", "Olmo2ForCausalLM", "Olmo3ForCausalLM",
+    "OlmoForCausalLM", "OlmoeForCausalLM", "OrionForCausalLM", "OuroForCausalLM",
+    "PanguEmbeddedForCausalLM", "PanguProMoEV2ForCausalLM", "PanguUltraMoEForCausalLM",
+    "PersimmonForCausalLM", "Phi3ForCausalLM", "Phi3VForCausalLM", "PhiForCausalLM",
+    "PhiMoEForCausalLM", "Plamo2ForCausalLM", "Plamo3ForCausalLM",
+    "PrithviGeoSpatialMAE", "QWenLMHeadModel", "Qwen2ForCausalLM",
+    "Qwen2ForProcessRewardModel", "Qwen2ForRewardModel", "Qwen2Model",
+    "Qwen2MoeForCausalLM", "Qwen2VLForConditionalGeneration", "Qwen3ForCausalLM",
+    "Qwen3MoeForCausalLM", "Qwen3NextForCausalLM", "RWForCausalLM",
+    "RobertaForMaskedLM", "RobertaForSequenceClassification", "RobertaModel",
+    "SeedOssForCausalLM", "SiglipModel", "SolarForCausalLM",
+    "StableLMEpochForCausalLM", "StableLmForCausalLM", "Starcoder2ForCausalLM",
+    "Step1ForCausalLM", "Step3TextForCausalLM", "Step3p5ForCausalLM",
+    "TeleChat2ForCausalLM", "TeleChatForCausalLM", "TeleFLMForCausalLM",
+    "Terratorch", "VoyageQwen3BidirectionalEmbedModel",
+    "XLMRobertaForSequenceClassification", "XLMRobertaModel", "XverseForCausalLM",
+    "Zamba2ForCausalLM",
+})
+
+
+def _extract_base_model_candidates(info: object) -> list[str]:
+    candidates: list[str] = []
+    card_data = getattr(info, "cardData", None)
+    if isinstance(card_data, dict):
+        base = card_data.get("base_model")
+        if isinstance(base, str) and base.strip():
+            candidates.append(base.strip())
+        elif isinstance(base, list):
+            candidates.extend(str(item).strip() for item in base if str(item).strip())
+
+    for tag in list(getattr(info, "tags", None) or []):
+        if isinstance(tag, str) and tag.startswith("base_model:"):
+            value = tag.split(":", 1)[1].strip()
+            if value:
+                candidates.append(value)
+
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for c in candidates:
+        if c not in seen:
+            dedup.append(c)
+            seen.add(c)
+    return dedup
+
+
+# Multimodal architectures that support image inputs
+_MULTIMODAL_ARCHITECTURES: frozenset[str] = frozenset({
+    "LlavaNextForConditionalGeneration",
+    "LlavaForConditionalGeneration",
+    "LlavaMistralForConditionalGeneration",
+    "LlavaLlamaForConditionalGeneration",
+    "Qwen2VLForConditionalGeneration",
+    "Qwen2VisionLanguageModel",
+    "Qwen2VisionTransformer",
+    "HCXVisionForCausalLM",
+    "MiniCPM3ForCausalLM",
+    "MiniCPMForCausalLM",
+    "LLaVANextImprovedForConditionalGeneration",
+    "MoE-Vision",
+    "VisionLanguageModelForCausalLM",
+    "XComposerForCausalLM",
+    "DeepseekVLForCausalLM",
+    "Qwen3ForCausalLM",  # Some Qwen3 versions support vision
+    "CharacterGLMForCausalLM",
+})
+
+_KNOWN_PIPELINE_TAGS: frozenset[str] = frozenset({
+    "automatic-speech-recognition",
+    "conversational",
+    "feature-extraction",
+    "fill-mask",
+    "image-classification",
+    "image-segmentation",
+    "image-text-to-text",
+    "image-to-text",
+    "object-detection",
+    "question-answering",
+    "sentence-similarity",
+    "summarization",
+    "table-question-answering",
+    "text-classification",
+    "text-generation",
+    "text-to-audio",
+    "text-to-image",
+    "text2text-generation",
+    "token-classification",
+    "translation",
+    "video-text-to-text",
+    "visual-question-answering",
+    "zero-shot-classification",
+})
+
+
+def _is_multimodal(info: object) -> bool:
+    """Check if model supports image/vision inputs."""
+    model_config = getattr(info, "config", None) or {}
+    architectures: list[str] = model_config.get("architectures", []) if isinstance(model_config, dict) else []
+    if architectures:
+        return any(arch in _MULTIMODAL_ARCHITECTURES for arch in architectures)
+
+    # Fallback: check model_id and tags for vision keywords
+    model_id = getattr(info, "id", "").lower()
+    tags = [str(t).lower() for t in (getattr(info, "tags", None) or [])]
+
+    vision_keywords = ["llava", "vision", "multimodal", "visual", "image", "qwen-vl", "deepseek-vl"]
+    for keyword in vision_keywords:
+        if keyword in model_id or any(keyword in tag for tag in tags):
+            return True
+
+    return False
+
+
+def _normalize_capability(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = value.strip().lower().replace("_", "-")
+    return normalized or None
+
+
+def _infer_capabilities(info: object) -> list[str]:
+    capabilities: list[str] = []
+
+    pipeline_tag = _normalize_capability(getattr(info, "pipeline_tag", None))
+    if pipeline_tag:
+        capabilities.append(pipeline_tag)
+
+    for tag in list(getattr(info, "tags", None) or []):
+        normalized_tag = _normalize_capability(str(tag))
+        if normalized_tag in _KNOWN_PIPELINE_TAGS:
+            capabilities.append(normalized_tag)
+
+    if _is_multimodal(info):
+        capabilities.append("image")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for capability in capabilities:
+        if capability not in seen:
+            deduped.append(capability)
+            seen.add(capability)
+    return deduped
+
+
+def _is_model_compatible(info: object, api: HfApi, tokenizer_repo_cache: dict[str, bool]) -> bool:
+    # Primary check: use architectures from config.json to match against vLLM whitelist.
+    model_config = getattr(info, "config", None) or {}
+    architectures: list[str] = model_config.get("architectures", []) if isinstance(model_config, dict) else []
+    if architectures:
+        return any(arch in _VLLM_SUPPORTED_ARCHITECTURES for arch in architectures)
+
+    # Fallback for models without an architectures field (e.g. GGUF-only repos):
+    # require at least safetensors/pytorch weights + config.json.
+    names = _sibling_names(info)
+    lowered = {n.lower() for n in names}
+    has_config = "config.json" in names
+    has_safetensors = any(n.endswith(".safetensors") or n.endswith(".safetensors.index.json") for n in lowered)
+    has_pytorch_bin = any(n.endswith("pytorch_model.bin") or n.endswith("pytorch_model.bin.index.json") for n in lowered)
+    if has_safetensors or has_pytorch_bin:
+        return has_config
+
+    return False
+
+
+async def list_models(
+    query: str = "",
+    limit: int = 20,
+    sort: str = "downloads",
+    task: str = "all",
+) -> list[HFModelInfo]:
+    task_filter = task.strip().lower() if task else "all"
     try:
         models = list(_get_api().list_models(
             search=query or None,
-            task="text-generation",
+            task=None if task_filter == "all" else task_filter,
             limit=limit,
             sort=sort if sort in ("downloads", "trending", "likes", "created_at") else "downloads",
         ))
     except HfHubHTTPError as exc:
         raise HuggingFaceError(str(exc)) from exc
 
-    return [
-        HFModelInfo(
-            model_id=m.id,
-            author=m.author,
-            pipeline_tag=m.pipeline_tag,
-            downloads=m.downloads or 0,
-            likes=m.likes or 0,
-            tags=list(m.tags or []),
-            last_modified=str(m.last_modified) if m.last_modified else None,
-            vram_required_gb=(
-                _estimate_vram_gb(getattr(m, "siblings", None))
-                or _estimate_vram_from_name(m.id)
-            ),
+    api = _get_api()
+    tokenizer_repo_cache: dict[str, bool] = {}
+    compatible: list[HFModelInfo] = []
+
+    for m in models:
+        try:
+            info = api.model_info(m.id)
+        except HfHubHTTPError:
+            continue
+        except Exception:
+            continue
+
+        if not _is_model_compatible(info, api, tokenizer_repo_cache):
+            continue
+
+        compatible.append(
+            HFModelInfo(
+                model_id=info.id,
+                author=info.author,
+                pipeline_tag=info.pipeline_tag,
+                downloads=info.downloads or 0,
+                likes=info.likes or 0,
+                tags=list(info.tags or []),
+                last_modified=str(info.last_modified) if info.last_modified else None,
+                vram_required_gb=(
+                    _estimate_vram_gb(getattr(info, "siblings", None))
+                    or _estimate_vram_from_name(info.id)
+                ),
+                supports_image=_is_multimodal(info),
+                capabilities=_infer_capabilities(info),
+            )
         )
-        for m in models
-    ]
+
+    return compatible
 
 
 async def model_info(model_id: str) -> HFModelInfo:
@@ -116,6 +366,8 @@ async def model_info(model_id: str) -> HFModelInfo:
             _estimate_vram_gb(getattr(info, "siblings", None))
             or _estimate_vram_from_name(info.id)
         ),
+        supports_image=_is_multimodal(info),
+        capabilities=_infer_capabilities(info),
     )
 
 

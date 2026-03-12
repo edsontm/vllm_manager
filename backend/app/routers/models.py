@@ -20,9 +20,10 @@ async def list_available_models(
     query: str = Query("", description="Search query for HuggingFace hub"),
     limit: int = Query(20, ge=1, le=100),
     sort: str = Query("downloads", description="Sort order: 'downloads' or 'trending'"),
+    task: str = Query("all", description="Optional HuggingFace task filter, e.g. text-generation or image-to-text"),
     _user=Depends(get_current_active_user),
 ):
-    return await hf_service.list_models(query=query, limit=limit, sort=sort)
+    return await hf_service.list_models(query=query, limit=limit, sort=sort, task=task)
 
 
 @router.get("/local", response_model=list[LocalModelInfo])

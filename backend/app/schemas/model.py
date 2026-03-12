@@ -12,6 +12,8 @@ class HFModelInfo(BaseModel):
     tags: list[str] = []
     last_modified: str | None = None
     vram_required_gb: float | None = None
+    supports_image: bool = False
+    capabilities: list[str] = []
 
 
 class LocalModelInfo(BaseModel):

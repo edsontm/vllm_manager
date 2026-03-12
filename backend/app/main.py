@@ -7,15 +7,20 @@ from urllib.parse import urlparse
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
+from app.core.security import hash_password
 from app.core.exceptions import (
     http_exception_handler,
     unhandled_exception_handler,
     VllmError,
 )
 from app.core.exceptions import NotFoundError, UnauthorizedError, ForbiddenError, ConflictError, QueueFullError, HuggingFaceError
+from app.dependencies import _SessionLocal
 from app.core.logging import RequestIDMiddleware, configure_logging
+from app.models.user import User
 from app.routers import (
     auth_router,
     instances_router,
@@ -49,6 +54,66 @@ def _host_port_from_url(url: str) -> tuple[str, int]:
     return parsed.hostname or "localhost", parsed.port or 5432
 
 
+async def _ensure_bootstrap_admin() -> None:
+    async with _SessionLocal() as db:
+        active_admin_query = select(User.id).where(
+            (User.role == "admin") & (User.is_active.is_(True))
+        ).limit(1)
+        active_admin = (await db.execute(active_admin_query)).scalar_one_or_none()
+        if active_admin is not None:
+            log.info("startup.admin_bootstrap.skip", reason="active_admin_exists")
+            return
+
+        candidate_query = (
+            select(User)
+            .where(
+                (User.username == settings.bootstrap_admin_username)
+                | (User.email == settings.bootstrap_admin_email)
+            )
+            .order_by(User.id.asc())
+            .limit(1)
+        )
+        candidate = (await db.execute(candidate_query)).scalars().first()
+
+        if candidate is None:
+            candidate = User(
+                username=settings.bootstrap_admin_username,
+                email=settings.bootstrap_admin_email,
+                hashed_password=hash_password(settings.bootstrap_admin_password),
+                role="admin",
+                queue_priority_role="high_priority",
+                is_active=True,
+            )
+            db.add(candidate)
+            action = "created"
+        else:
+            candidate.role = "admin"
+            candidate.is_active = True
+            candidate.queue_priority_role = "high_priority"
+            candidate.hashed_password = hash_password(settings.bootstrap_admin_password)
+            action = "promoted"
+
+        try:
+            await db.commit()
+        except IntegrityError:
+            # Multiple workers can run startup concurrently; another worker may
+            # create the same bootstrap admin first.
+            await db.rollback()
+            active_admin = (await db.execute(active_admin_query)).scalar_one_or_none()
+            if active_admin is not None:
+                log.info("startup.admin_bootstrap.skip", reason="active_admin_created_by_other_worker")
+                return
+            raise
+
+        await db.refresh(candidate)
+        log.warning(
+            "startup.admin_bootstrap.done",
+            action=action,
+            username=candidate.username,
+            email=candidate.email,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── Startup: connectivity checks ─────────────────────────────────────────
@@ -57,6 +122,7 @@ async def lifespan(app: FastAPI):
     log.info("startup.port_check.begin", db=f"{db_host}:{db_port}", redis=f"{redis_host}:{redis_port}")
     _check_port(db_host, db_port, "PostgreSQL")
     _check_port(redis_host, redis_port, "Redis")
+    await _ensure_bootstrap_admin()
     log.info("startup.port_check.ok", postgres="up", redis="up")
 
     yield

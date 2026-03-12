@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     # Metrics
     metrics_poll_interval_s: int = 30
 
+    # Bootstrap admin account
+    bootstrap_admin_username: str = "admin"
+    bootstrap_admin_email: str = "admin@example.com"
+    bootstrap_admin_password: str = "16ceb20f"
+
     @field_validator("vllm_bind_host")
     @classmethod
     def must_be_localhost(cls, v: str) -> str:

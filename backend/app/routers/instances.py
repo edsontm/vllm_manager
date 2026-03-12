@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import AsyncIterator
 
 from fastapi import APIRouter, Depends, Query
@@ -21,20 +22,31 @@ from app.services import vllm_service
 router = APIRouter(prefix="/instances", tags=["Instances"])
 
 
-def _connection_examples(slug: str) -> ConnectionExamples:
+def _connection_examples(slug: str, model_id: str) -> ConnectionExamples:
     base = f"{settings.base_url.rstrip('/')}/v1/{slug}"
+    python_model = repr(model_id)
+    js_model = json.dumps(model_id)
+    curl_payload = json.dumps(
+        {
+            "model": model_id,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+    )
+    # Escape single quotes for safe embedding in a single-quoted shell string.
+    curl_payload = curl_payload.replace("'", "'\"'\"'")
+
     return ConnectionExamples(
         curl=(
             f"curl {base}/chat/completions \\\n"
             "  -H 'Content-Type: application/json' \\\n"
             "  -H 'Authorization: Bearer YOUR_TOKEN' \\\n"
-            "  -d '{\"model\":\"...\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}'"
+            f"  -d '{curl_payload}'"
         ),
         python=(
             "from openai import OpenAI\n\n"
             f"client = OpenAI(base_url='{base}', api_key='YOUR_TOKEN')\n"
             "resp = client.chat.completions.create(\n"
-            "    model='...',\n"
+            f"    model={python_model},\n"
             "    messages=[{'role': 'user', 'content': 'Hi'}],\n"
             ")\n"
             "print(resp.choices[0].message.content)"
@@ -43,7 +55,7 @@ def _connection_examples(slug: str) -> ConnectionExamples:
             "import OpenAI from 'openai';\n\n"
             f"const client = new OpenAI({{ baseURL: '{base}', apiKey: 'YOUR_TOKEN' }});\n"
             "const resp = await client.chat.completions.create({{\n"
-            "  model: '...',\n"
+            f"  model: {js_model},\n"
             "  messages: [{{ role: 'user', content: 'Hi' }}],\n"
             "}});\n"
             "console.log(resp.choices[0].message.content);"
@@ -178,4 +190,4 @@ async def connection_examples(
     db: AsyncSession = Depends(get_db),
 ):
     instance = await vllm_service.get_instance(db, instance_id)
-    return _connection_examples(instance.slug)
+    return _connection_examples(instance.slug, instance.model_id)

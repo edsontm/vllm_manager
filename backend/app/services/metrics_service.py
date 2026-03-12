@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from functools import partial
 
+import docker
 import redis.asyncio as aioredis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +12,153 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.request_log import RequestLog
 from app.models.vllm_instance import VllmInstance
 from app.schemas.metrics import ContextLengthSuggestion, GpuInfo, GpuSummary, InstanceMetrics, MetricsSummary, MetricPoint
+
+_docker_client: docker.DockerClient | None = None
+
+
+def _get_docker() -> docker.DockerClient:
+    global _docker_client
+    if _docker_client is None:
+        _docker_client = docker.from_env()
+    return _docker_client
+
+
+def _parse_gpu_csv_output(text: str) -> list[GpuInfo]:
+    gpus: list[GpuInfo] = []
+    for line in text.strip().splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 6:
+            continue
+        idx, name, total, used, free, util_str = parts[:6]
+        try:
+            utilization = int(util_str)
+        except (TypeError, ValueError):
+            utilization = None
+
+        try:
+            gpus.append(
+                GpuInfo(
+                    index=int(idx),
+                    name=name,
+                    memory_total_mb=int(float(total)),
+                    memory_used_mb=int(float(used)),
+                    memory_free_mb=int(float(free)),
+                    utilization_pct=utilization,
+                )
+            )
+        except ValueError:
+            continue
+    return gpus
+
+
+def _read_gpu_summary_via_container_exec() -> list[GpuInfo]:
+    try:
+        containers = _get_docker().containers.list(filters={"status": "running"})
+    except Exception:
+        return []
+
+    preferred = sorted(
+        containers,
+        key=lambda container: 0 if any(name.startswith("/vllm_") for name in getattr(container, "attrs", {}).get("Name", "") and [getattr(container, "attrs", {}).get("Name", "")]) else 1,
+    )
+
+    for container in preferred:
+        try:
+            exec_result = container.exec_run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ]
+            )
+        except Exception:
+            continue
+
+        if exec_result.exit_code != 0:
+            continue
+
+        output = exec_result.output.decode("utf-8", errors="replace") if isinstance(exec_result.output, bytes) else str(exec_result.output)
+        parsed = _parse_gpu_csv_output(output)
+        if parsed:
+            return parsed
+
+    return []
+
+
+def _read_container_gpu_stats(container_id: str | None) -> dict[str, float] | None:
+    if not container_id:
+        return None
+
+    try:
+        container = _get_docker().containers.get(container_id)
+    except Exception:
+        return None
+
+
+def _read_assigned_gpu_stats(gpu_ids: list[int] | None) -> dict[str, float] | None:
+    if not gpu_ids:
+        return None
+
+    gpus = _read_gpu_summary_via_container_exec()
+    if not gpus:
+        return None
+
+    selected = [gpu for gpu in gpus if gpu.index in set(gpu_ids)]
+    if not selected:
+        return None
+
+    return {
+        "gpu_memory_used_mb": round(float(sum(gpu.memory_used_mb for gpu in selected)), 1),
+        "gpu_memory_total_mb": round(float(sum(gpu.memory_total_mb for gpu in selected)), 1),
+        "gpu_utilization_pct": round(
+            sum(gpu.utilization_pct or 0 for gpu in selected) / len(selected),
+            1,
+        ) if selected else None,
+    }
+
+    try:
+        gpu_result = container.exec_run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ]
+        )
+        if gpu_result.exit_code != 0:
+            return None
+
+        gpu_output = gpu_result.output.decode("utf-8", errors="replace") if isinstance(gpu_result.output, bytes) else str(gpu_result.output)
+        visible_gpus = _parse_gpu_csv_output(gpu_output)
+        if not visible_gpus:
+            return None
+
+        processes_result = container.exec_run(
+            [
+                "sh",
+                "-lc",
+                "nvidia-smi --query-compute-apps=used_gpu_memory --format=csv,noheader,nounits 2>/dev/null || true",
+            ]
+        )
+        processes_output = processes_result.output.decode("utf-8", errors="replace") if isinstance(processes_result.output, bytes) else str(processes_result.output)
+
+        used_mb = 0.0
+        for line in processes_output.strip().splitlines():
+            value = line.strip().split()[0] if line.strip() else ""
+            try:
+                used_mb += float(value)
+            except ValueError:
+                continue
+
+        total_mb = float(sum(gpu.memory_total_mb for gpu in visible_gpus))
+        if used_mb <= 0:
+            used_mb = float(sum(gpu.memory_used_mb for gpu in visible_gpus))
+
+        return {
+            "gpu_memory_used_mb": round(used_mb, 1),
+            "gpu_memory_total_mb": round(total_mb, 1),
+        }
+    except Exception:
+        return None
 
 
 def _live_key(instance_id: int) -> str:
@@ -46,20 +195,113 @@ async def _build_instance_metrics(
     )
     total = (await db.execute(total_q)).scalar_one() or 0
     avg_ctx = (await db.execute(avg_ctx_q)).scalar_one()
+    memory_stats: dict[str, float] = {}
+    gpu_stats: dict[str, float] = {}
+    if instance.status == "running":
+        memory_stats = await _get_container_memory_stats(instance.container_id)
+        gpu_stats = await _get_container_gpu_metrics(instance.container_id)
+        if not gpu_stats:
+            gpu_stats = await _get_assigned_gpu_metrics(list(instance.gpu_ids or []))
 
     return InstanceMetrics(
         instance_id=instance.id,
         slug=instance.slug,
         status=instance.status,
-        gpu_utilization_pct=live.get("gpu_utilization_pct"),
-        gpu_memory_used_mb=live.get("gpu_memory_used_mb"),
-        gpu_memory_total_mb=live.get("gpu_memory_total_mb"),
+        gpu_utilization_pct=gpu_stats.get("gpu_utilization_pct", live.get("gpu_utilization_pct")),
+        gpu_memory_used_mb=gpu_stats.get("gpu_memory_used_mb", live.get("gpu_memory_used_mb")),
+        gpu_memory_total_mb=gpu_stats.get("gpu_memory_total_mb", live.get("gpu_memory_total_mb")),
         tokens_per_second=live.get("tokens_per_second"),
         avg_latency_ms=live.get("avg_latency_ms"),
         queue_depth=depth,
         requests_total_1h=total,
         avg_context_length=float(avg_ctx) if avg_ctx else None,
+        system_memory_used_mb=memory_stats.get("system_memory_used_mb"),
+        system_memory_total_mb=memory_stats.get("system_memory_total_mb"),
     )
+
+
+def _read_system_memory_snapshot() -> dict[str, float] | None:
+    try:
+        values_kb: dict[str, float] = {}
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                key, raw_value = line.split(":", 1)
+                parts = raw_value.strip().split()
+                if not parts:
+                    continue
+                values_kb[key] = float(parts[0])
+
+        total_mb = values_kb.get("MemTotal", 0.0) / 1024
+        available_mb = values_kb.get("MemAvailable", 0.0) / 1024
+        if total_mb <= 0:
+            return None
+        used_mb = max(total_mb - available_mb, 0.0)
+        return {
+            "system_memory_total_mb": round(total_mb, 1),
+            "system_memory_used_mb": round(used_mb, 1),
+            "system_memory_free_mb": round(available_mb, 1),
+        }
+    except Exception:
+        return None
+
+
+def _read_container_memory_stats(container_id: str | None) -> dict[str, float] | None:
+    if not container_id:
+        return None
+
+    try:
+        container = _get_docker().containers.get(container_id)
+        stats = container.stats(stream=False)
+    except Exception:
+        return None
+
+    memory_stats = stats.get("memory_stats") or {}
+    usage_bytes = float(memory_stats.get("usage") or 0)
+    stats_details = memory_stats.get("stats") or {}
+    cache_bytes = float(
+        stats_details.get("cache")
+        or stats_details.get("inactive_file")
+        or stats_details.get("total_inactive_file")
+        or 0
+    )
+    limit_bytes = float(memory_stats.get("limit") or 0)
+
+    used_mb = max((usage_bytes - cache_bytes) / 1024 / 1024, 0.0)
+    total_mb = limit_bytes / 1024 / 1024 if limit_bytes > 0 else None
+    return {
+        "system_memory_used_mb": round(used_mb, 1),
+        "system_memory_total_mb": round(total_mb, 1) if total_mb is not None else None,
+    }
+
+
+async def _get_container_memory_stats(container_id: str | None) -> dict[str, float]:
+    if not container_id:
+        return {}
+    import asyncio
+
+    loop = asyncio.get_event_loop()
+    stats = await loop.run_in_executor(None, partial(_read_container_memory_stats, container_id))
+    return stats or {}
+
+
+async def _get_container_gpu_metrics(container_id: str | None) -> dict[str, float]:
+    if not container_id:
+        return {}
+    import asyncio
+
+    loop = asyncio.get_event_loop()
+    stats = await loop.run_in_executor(None, partial(_read_container_gpu_stats, container_id))
+    return stats or {}
+
+
+async def _get_assigned_gpu_metrics(gpu_ids: list[int]) -> dict[str, float]:
+    if not gpu_ids:
+        return {}
+    import asyncio
+
+    loop = asyncio.get_event_loop()
+    stats = await loop.run_in_executor(None, partial(_read_assigned_gpu_stats, gpu_ids))
+    return stats or {}
 
 
 async def get_gpu_summary() -> GpuSummary:
@@ -131,11 +373,20 @@ async def get_gpu_summary() -> GpuSummary:
         gpus = _via_pynvml()
         if gpus is not None:
             return gpus
-        return _via_nvidiasmi()
+        gpus = _via_nvidiasmi()
+        if gpus:
+            return gpus
+        return _read_gpu_summary_via_container_exec()
 
     loop = asyncio.get_event_loop()
     gpus = await loop.run_in_executor(None, _collect)
-    return GpuSummary(gpus=gpus)
+    system_memory = await loop.run_in_executor(None, _read_system_memory_snapshot)
+    return GpuSummary(
+        gpus=gpus,
+        system_memory_total_mb=system_memory.get("system_memory_total_mb") if system_memory else None,
+        system_memory_used_mb=system_memory.get("system_memory_used_mb") if system_memory else None,
+        system_memory_free_mb=system_memory.get("system_memory_free_mb") if system_memory else None,
+    )
 
 
 async def get_summary(db: AsyncSession, redis: aioredis.Redis) -> MetricsSummary:
@@ -144,7 +395,14 @@ async def get_summary(db: AsyncSession, redis: aioredis.Redis) -> MetricsSummary
 
     metrics = [await _build_instance_metrics(inst, db, redis) for inst in instances]
     total = sum(m.requests_total_1h for m in metrics)
-    return MetricsSummary(instances=metrics, total_requests_1h=total)
+    total_instance_gpu_memory_used_mb = sum((m.gpu_memory_used_mb or 0) for m in metrics)
+    total_instance_system_memory_used_mb = sum((m.system_memory_used_mb or 0) for m in metrics)
+    return MetricsSummary(
+        instances=metrics,
+        total_requests_1h=total,
+        total_instance_gpu_memory_used_mb=round(total_instance_gpu_memory_used_mb, 1),
+        total_instance_system_memory_used_mb=round(total_instance_system_memory_used_mb, 1),
+    )
 
 
 async def get_instance_metrics(

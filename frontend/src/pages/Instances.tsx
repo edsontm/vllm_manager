@@ -7,12 +7,31 @@ import { useAuthStore } from '@/store'
 import CodeExample from '@/components/CodeExample'
 import { Play, Square, RefreshCw, Trash2, Plus, ChevronDown, Pencil, Cpu } from 'lucide-react'
 
+const toGb = (mb: number) => (mb / 1024).toFixed(1)
+
+function ResourceBar({ used, total, label }: { used: number; total: number; label: string }) {
+  const safeTotal = total > 0 ? total : used
+  const pct = safeTotal > 0 ? Math.min(100, Math.round((used / safeTotal) * 100)) : 0
+  const color = pct > 90 ? 'bg-red-500' : pct > 70 ? 'bg-yellow-500' : 'bg-indigo-500'
+
+  return (
+    <div className="flex items-center gap-2 w-full">
+      <span className="font-mono text-[10px] text-gray-500 whitespace-nowrap">{label}</span>
+      <div className="flex-1 h-1.5 bg-gray-800 rounded-full overflow-hidden">
+        <div className={`h-full rounded-full transition-all duration-700 ${color}`} style={{ width: `${pct}%` }} />
+      </div>
+      <span className="font-mono text-[10px] text-gray-400 whitespace-nowrap">
+        {toGb(used)} / {toGb(safeTotal)} GB <span className="text-gray-600">({pct}%)</span>
+      </span>
+    </div>
+  )
+}
+
 // ── GPU VRAM panel ────────────────────────────────────────────────────────────
 
 function GpuBar({ gpu }: { gpu: GpuInfo }) {
   const pct = Math.round((gpu.memory_used_mb / gpu.memory_total_mb) * 100)
   const color = pct > 90 ? 'bg-red-500' : pct > 70 ? 'bg-yellow-500' : 'bg-green-500'
-  const toGb = (mb: number) => (mb / 1024).toFixed(1)
   return (
     <div className="flex-1 min-w-[180px]">
       <div className="flex items-center justify-between mb-1">
@@ -36,20 +55,12 @@ function GpuBar({ gpu }: { gpu: GpuInfo }) {
   )
 }
 
-function GpuPanel() {
-  const { data, isError } = useQuery({
-    queryKey: ['metrics-gpus'],
-    queryFn: metricsApi.gpus,
-    refetchInterval: 3_000,
-    retry: false,
-  })
+function GpuPanel({ gpus }: { gpus?: GpuInfo[] }) {
+  if (!gpus || gpus.length === 0) return null
 
-  if (isError || !data || data.gpus.length === 0) return null
-
-  const totalMb = data.gpus.reduce((s, g) => s + g.memory_total_mb, 0)
-  const usedMb = data.gpus.reduce((s, g) => s + g.memory_used_mb, 0)
+  const totalMb = gpus.reduce((s, g) => s + g.memory_total_mb, 0)
+  const usedMb = gpus.reduce((s, g) => s + g.memory_used_mb, 0)
   const freeMb = totalMb - usedMb
-  const toGb = (mb: number) => (mb / 1024).toFixed(1)
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 mb-6">
@@ -65,7 +76,70 @@ function GpuPanel() {
         </div>
       </div>
       <div className="flex flex-wrap gap-4">
-        {data.gpus.map((gpu) => <GpuBar key={gpu.index} gpu={gpu} />)}
+        {gpus.map((gpu) => <GpuBar key={gpu.index} gpu={gpu} />)}
+      </div>
+    </div>
+  )
+}
+
+function ResourceSummaryPanel({
+  gpus,
+  totalInstanceGpuUsedMb,
+  totalInstanceRamUsedMb,
+  systemMemoryTotalMb,
+  systemMemoryUsedMb,
+  systemMemoryFreeMb,
+}: {
+  gpus?: GpuInfo[]
+  totalInstanceGpuUsedMb: number
+  totalInstanceRamUsedMb: number
+  systemMemoryTotalMb: number | null
+  systemMemoryUsedMb: number | null
+  systemMemoryFreeMb: number | null
+}) {
+  const totalGpuMb = (gpus ?? []).reduce((sum, gpu) => sum + gpu.memory_total_mb, 0)
+  const usedGpuMb = (gpus ?? []).reduce((sum, gpu) => sum + gpu.memory_used_mb, 0)
+  const freeGpuMb = Math.max(totalGpuMb - usedGpuMb, 0)
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 mb-6 space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="font-heading font-[800] text-sm text-white">System Memory Overview</h2>
+          <p className="font-sans font-[200] text-xs text-gray-500">Live host availability and aggregate instance consumption.</p>
+        </div>
+        <div className="flex flex-wrap gap-4 text-[11px] font-mono">
+          <span className="text-indigo-300">Models VRAM <span className="text-white">{toGb(totalInstanceGpuUsedMb)} GB</span></span>
+          <span className="text-cyan-300">Models RAM <span className="text-white">{toGb(totalInstanceRamUsedMb)} GB</span></span>
+          <span className="text-green-400">Free VRAM <span className="text-white">{toGb(freeGpuMb)} GB</span></span>
+          {systemMemoryFreeMb != null && <span className="text-green-400">Free RAM <span className="text-white">{toGb(systemMemoryFreeMb)} GB</span></span>}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="bg-gray-950/60 border border-gray-800 rounded-lg p-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="font-mono text-[11px] uppercase text-gray-500">Host VRAM</span>
+            <span className="font-mono text-[10px] text-gray-600">{toGb(usedGpuMb)} used · {toGb(freeGpuMb)} free</span>
+          </div>
+          {totalGpuMb > 0 ? <ResourceBar used={usedGpuMb} total={totalGpuMb} label="VRAM" /> : <p className="text-xs text-gray-600">No GPU data available.</p>}
+        </div>
+
+        <div className="bg-gray-950/60 border border-gray-800 rounded-lg p-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="font-mono text-[11px] uppercase text-gray-500">Host RAM</span>
+            {systemMemoryTotalMb != null && systemMemoryUsedMb != null ? (
+              <span className="font-mono text-[10px] text-gray-600">{toGb(systemMemoryUsedMb)} used · {toGb(systemMemoryFreeMb ?? 0)} free</span>
+            ) : (
+              <span className="font-mono text-[10px] text-gray-600">Unavailable</span>
+            )}
+          </div>
+          {systemMemoryTotalMb != null && systemMemoryUsedMb != null ? (
+            <ResourceBar used={systemMemoryUsedMb} total={systemMemoryTotalMb} label="RAM" />
+          ) : (
+            <p className="text-xs text-gray-600">System RAM metrics unavailable.</p>
+          )}
+        </div>
       </div>
     </div>
   )
@@ -73,19 +147,20 @@ function GpuPanel() {
 
 // ── Instance VRAM bar ─────────────────────────────────────────────────────────
 
-function VramBar({ used, total }: { used: number; total: number }) {
-  const pct = Math.min(100, Math.round((used / total) * 100))
-  const color = pct > 90 ? 'bg-red-500' : pct > 70 ? 'bg-yellow-500' : 'bg-indigo-500'
-  const toGb = (mb: number) => (mb / 1024).toFixed(1)
+function MachineGpuUsage({ gpus }: { gpus: GpuInfo[] }) {
+  if (gpus.length === 0) return null
+
   return (
-    <div className="flex items-center gap-2 w-full">
-      <span className="font-mono text-[10px] text-gray-500 whitespace-nowrap">VRAM</span>
-      <div className="flex-1 h-1.5 bg-gray-800 rounded-full overflow-hidden">
-        <div className={`h-full rounded-full transition-all duration-700 ${color}`} style={{ width: `${pct}%` }} />
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-[10px] text-gray-500 uppercase">Machine GPU VRAM</span>
+        <span className="font-mono text-[10px] text-gray-600">
+          {gpus.length} GPU{gpus.length === 1 ? '' : 's'} available
+        </span>
       </div>
-      <span className="font-mono text-[10px] text-gray-400 whitespace-nowrap">
-        {toGb(used)} / {toGb(total)} GB <span className="text-gray-600">({pct}%)</span>
-      </span>
+      <div className="flex flex-wrap gap-3">
+        {gpus.map((gpu) => <GpuBar key={gpu.index} gpu={gpu} />)}
+      </div>
     </div>
   )
 }
@@ -374,7 +449,7 @@ const STATUS_COLOR: Record<string, string> = {
 
 // ── Instance row ──────────────────────────────────────────────────────────────
 
-function InstanceRow({ instance, metrics }: { instance: InstanceRead; metrics?: InstanceMetrics }) {
+function InstanceRow({ instance, metrics, machineGpus = [] }: { instance: InstanceRead; metrics?: InstanceMetrics; machineGpus?: GpuInfo[] }) {
   const qc = useQueryClient()
   const isAdmin = useAuthStore((s) => s.currentUser?.role === 'admin')
   const [showExamples, setShowExamples] = useState(false)
@@ -457,7 +532,15 @@ function InstanceRow({ instance, metrics }: { instance: InstanceRead; metrics?: 
 
       {/* VRAM bar (running instances with live data) */}
       {instance.status === 'running' && metrics?.gpu_memory_used_mb != null && metrics?.gpu_memory_total_mb != null && (
-        <VramBar used={metrics.gpu_memory_used_mb} total={metrics.gpu_memory_total_mb} />
+        <ResourceBar used={metrics.gpu_memory_used_mb} total={metrics.gpu_memory_total_mb} label="Observed VRAM" />
+      )}
+
+      {instance.status === 'running' && metrics?.system_memory_used_mb != null && metrics?.system_memory_total_mb != null && (
+        <ResourceBar used={metrics.system_memory_used_mb} total={metrics.system_memory_total_mb} label="Container RAM" />
+      )}
+
+      {instance.status === 'running' && machineGpus.length > 0 && (
+        <MachineGpuUsage gpus={machineGpus} />
       )}
 
       {/* Error message from crashed container */}
@@ -572,6 +655,12 @@ export default function Instances() {
     refetchInterval: 5_000,
     retry: false,
   })
+  const { data: gpuSummary } = useQuery({
+    queryKey: ['metrics-gpus'],
+    queryFn: metricsApi.gpus,
+    refetchInterval: 3_000,
+    retry: false,
+  })
   const isAdmin = useAuthStore((s) => s.currentUser?.role === 'admin')
   const [showCreate, setShowCreate] = useState(false)
 
@@ -594,7 +683,16 @@ export default function Instances() {
         )}
       </div>
 
-      <GpuPanel />
+      <ResourceSummaryPanel
+        gpus={gpuSummary?.gpus}
+        totalInstanceGpuUsedMb={metricsSummary?.total_instance_gpu_memory_used_mb ?? 0}
+        totalInstanceRamUsedMb={metricsSummary?.total_instance_system_memory_used_mb ?? 0}
+        systemMemoryTotalMb={gpuSummary?.system_memory_total_mb ?? null}
+        systemMemoryUsedMb={gpuSummary?.system_memory_used_mb ?? null}
+        systemMemoryFreeMb={gpuSummary?.system_memory_free_mb ?? null}
+      />
+
+      <GpuPanel gpus={gpuSummary?.gpus} />
 
       {showCreate && isAdmin && (
         <InstanceForm prefill={prefill} onClose={() => setShowCreate(false)} />
@@ -618,7 +716,14 @@ export default function Instances() {
         <p className="text-gray-500 font-sans font-[200]">No instances yet.</p>
       ) : (
         <div className="space-y-4">
-          {instances.map((inst) => <InstanceRow key={inst.id} instance={inst} metrics={metricsById[inst.id]} />)}
+          {instances.map((inst) => (
+            <InstanceRow
+              key={inst.id}
+              instance={inst}
+              metrics={metricsById[inst.id]}
+              machineGpus={gpuSummary?.gpus ?? []}
+            />
+          ))}
         </div>
       )}
     </div>

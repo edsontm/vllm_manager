@@ -2,12 +2,32 @@ import { useState, useMemo } from "react"
 import { useNavigate } from "react-router-dom"
 import { useQuery } from "@tanstack/react-query"
 import { modelsApi, type HFModelInfo, type LocalModelInfo } from "@/api/modelsApi"
-import { HardDrive, Cpu } from "lucide-react"
+import { HardDrive, Cpu, Image } from "lucide-react"
 
 // ── types ──────────────────────────────────────────────────────────────────────
 type HubSort = "popularity" | "vram_asc" | "vram_desc"
+type HubTask =
+  | "all"
+  | "text-generation"
+  | "image"
+  | "image-text-to-text"
+  | "image-to-text"
+  | "visual-question-answering"
+  | "feature-extraction"
+  | "text-classification"
 type LocalSort = "name" | "vram_asc" | "vram_desc" | "size"
 type VramCeiling = 8 | 16 | 24 | 40 | 80 | null
+
+const HUB_TASK_OPTIONS: { label: string; value: HubTask }[] = [
+  { label: "All", value: "all" },
+  { label: "Text", value: "text-generation" },
+  { label: "Image", value: "image" },
+  { label: "Image + Text", value: "image-text-to-text" },
+  { label: "OCR", value: "image-to-text" },
+  { label: "VQA", value: "visual-question-answering" },
+  { label: "Embeddings", value: "feature-extraction" },
+  { label: "Classification", value: "text-classification" },
+]
 
 const VRAM_CEILINGS: { label: string; value: VramCeiling }[] = [
   { label: "Any", value: null },
@@ -90,6 +110,30 @@ function displayName(modelId: string): string {
   return tail.replace(/[-_]/g, " ").replace(/\w/g, (c: string) => c.toUpperCase())
 }
 
+function formatCapabilityLabel(capability: string): string {
+  if (capability === "image") return "Image"
+  return capability
+    .split("-")
+    .map((part) => (part.length <= 3 ? part.toUpperCase() : part.charAt(0).toUpperCase() + part.slice(1)))
+    .join(" ")
+}
+
+function CapabilityChip({ capability }: { capability: string }) {
+  const isImageCapability = capability === "image" || capability.includes("image") || capability.includes("visual")
+
+  return (
+    <span
+      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono font-[600] text-xs ${
+        isImageCapability ? "bg-cyan-950 text-cyan-400" : "bg-gray-800 text-gray-300"
+      }`}
+      title={formatCapabilityLabel(capability)}
+    >
+      {isImageCapability && <Image size={10} />}
+      {formatCapabilityLabel(capability)}
+    </span>
+  )
+}
+
 function ModelCard({ model }: { model: HFModelInfo }) {
   const navigate = useNavigate()
   const handlePrefill = () => {
@@ -110,6 +154,7 @@ function ModelCard({ model }: { model: HFModelInfo }) {
         <span className="font-mono font-[600] text-xs text-gray-500">↓ {model.downloads.toLocaleString()}</span>
         <span className="font-mono font-[600] text-xs text-gray-500">♡ {model.likes.toLocaleString()}</span>
         {vramChip(model.vram_required_gb)}
+        {model.capabilities.map((capability) => <CapabilityChip key={capability} capability={capability} />)}
       </div>
     </div>
   )
@@ -144,6 +189,8 @@ export default function Models() {
 
   // Hub tab controls
   const [hubSort, setHubSort] = useState<HubSort>("popularity")
+  const [hubTask, setHubTask] = useState<HubTask>("all")
+  const [selectedCapability, setSelectedCapability] = useState<string>("all")
 
   const handleHubVramClick = () => {
     setHubSort((prev) =>
@@ -157,9 +204,14 @@ export default function Models() {
   const [localVramCeiling, setLocalVramCeiling] = useState<VramCeiling>(null)
 
   const { data: hubModels = [], isLoading: loadingHub } = useQuery({
-    queryKey: ["models-hub", search, hubSort],
+    queryKey: ["models-hub", search, hubSort, hubTask],
     queryFn: () =>
-      modelsApi.available(search, 50, hubSort === "popularity" ? "downloads" : "downloads"),
+      modelsApi.available(
+        search,
+        50,
+        hubSort === "popularity" ? "downloads" : "downloads",
+        hubTask === "image" ? "all" : hubTask,
+      ),
     enabled: activeTab === "hub",
   })
 
@@ -169,9 +221,23 @@ export default function Models() {
     enabled: activeTab === "local",
   })
 
+  const availableCapabilities = useMemo(() => {
+    const values = new Set<string>()
+    hubModels.forEach((model) => {
+      model.capabilities.forEach((capability) => values.add(capability))
+    })
+    return ["all", ...Array.from(values).sort((a, b) => a.localeCompare(b))]
+  }, [hubModels])
+
   // Hub: client-side sort by VRAM then filter by ceiling
   const processedHub = useMemo(() => {
     let list = [...hubModels]
+    if (hubTask === "image") {
+      list = list.filter((model) => model.supports_image || model.capabilities.includes("image"))
+    }
+    if (selectedCapability !== "all") {
+      list = list.filter((model) => model.capabilities.includes(selectedCapability))
+    }
     if (hubSort === "vram_asc" || hubSort === "vram_desc") {
       const dir = hubSort === "vram_asc" ? 1 : -1
       list.sort((a, b) => {
@@ -185,7 +251,7 @@ export default function Models() {
       list = list.filter((m) => m.vram_required_gb === null || m.vram_required_gb <= hubVramCeiling)
     }
     return list
-  }, [hubModels, hubSort, hubVramCeiling])
+  }, [hubModels, hubSort, hubTask, hubVramCeiling, selectedCapability])
 
   // Local: client-side sort + filter
   const processedLocal = useMemo(() => {
@@ -204,6 +270,7 @@ export default function Models() {
     setSearch(v)
     setHubSort("popularity")
     setHubVramCeiling(null)
+    setSelectedCapability("all")
   }
 
   const hubVramActive = hubSort === "vram_asc" || hubSort === "vram_desc"
@@ -242,6 +309,21 @@ export default function Models() {
               placeholder="Search HuggingFace hub…"
               className="w-full max-w-md bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white font-mono font-[300] text-sm focus:outline-none focus:border-indigo-500"
             />
+            <div className="flex flex-col gap-1">
+              <span className="font-sans font-[200] text-[11px] uppercase tracking-widest text-gray-500">Task</span>
+              <select
+                value={hubTask}
+                onChange={(e) => {
+                  setHubTask(e.target.value as HubTask)
+                  setSelectedCapability("all")
+                }}
+                className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white font-mono font-[300] text-sm focus:outline-none focus:border-indigo-500"
+              >
+                {HUB_TASK_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </div>
           </div>
           <div className="flex flex-wrap gap-4 items-center mb-5">
             <div className="flex items-center gap-2">
@@ -272,6 +354,24 @@ export default function Models() {
             </div>
             <VramFilter value={hubVramCeiling} onChange={setHubVramCeiling} />
           </div>
+          {availableCapabilities.length > 1 && (
+            <div className="flex flex-wrap gap-2 items-center mb-5">
+              <span className="font-sans font-[200] text-[11px] uppercase tracking-widest text-gray-500">Capabilities</span>
+              {availableCapabilities.map((capability) => (
+                <button
+                  key={capability}
+                  onClick={() => setSelectedCapability(capability)}
+                  className={`px-3 py-1 rounded text-xs transition-colors font-mono font-[600] ${
+                    selectedCapability === capability
+                      ? "bg-indigo-600 text-white"
+                      : "text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700"
+                  }`}
+                >
+                  {capability === "all" ? "All" : formatCapabilityLabel(capability)}
+                </button>
+              ))}
+            </div>
+          )}
 
           {loadingHub ? (
             <p className="text-gray-500 font-sans font-[200]">Searching…</p>

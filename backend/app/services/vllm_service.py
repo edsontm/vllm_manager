@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import re
+import shlex
 import socket
 from typing import AsyncIterator
 
 import docker
 import structlog
+from huggingface_hub import HfApi
+from huggingface_hub.utils import HfHubHTTPError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,24 +30,313 @@ def _get_docker() -> docker.DockerClient:
 
 
 def _port_is_free(port: int) -> bool:
+    # Binding verifies the port can actually be reserved on the host.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.5)
-        return s.connect_ex(("127.0.0.1", port)) != 0
+        try:
+            s.bind((settings.vllm_bind_host, port))
+            return True
+        except OSError:
+            return False
+
+
+def _docker_reserved_ports() -> set[int]:
+    try:
+        client = _get_docker()
+        reserved: set[int] = set()
+        containers = client.containers.list(all=True)
+
+        for container in containers:
+            attrs = getattr(container, "attrs", {}) or {}
+            port_map = attrs.get("NetworkSettings", {}).get("Ports", {})
+            if not isinstance(port_map, dict):
+                continue
+
+            for bindings in port_map.values():
+                if not bindings:
+                    continue
+                for binding in bindings:
+                    if not isinstance(binding, dict):
+                        continue
+                    host_port = binding.get("HostPort")
+                    if isinstance(host_port, str) and host_port.isdigit():
+                        reserved.add(int(host_port))
+
+        return reserved
+    except Exception as exc:
+        logger.warning("docker_reserved_ports_probe_failed", error=str(exc))
+        return set()
 
 
 async def allocate_port(db: AsyncSession) -> int:
     result = await db.execute(select(VllmInstance.internal_port))
     used = {row[0] for row in result.all()}
+    docker_reserved = _docker_reserved_ports()
 
     for port in range(settings.vllm_base_port, settings.vllm_base_port + settings.vllm_port_range):
-        if port not in used and _port_is_free(port):
+        if port in used or port in docker_reserved:
+            continue
+        if _port_is_free(port):
             return port
 
     raise QueueFullError("No free vLLM port available in configured range")
 
 
-def _build_vllm_args(instance: VllmInstance) -> list[str]:
-    args = ["--model", instance.model_id, "--host", "0.0.0.0", "--port", str(instance.internal_port)]
+def _normalize_flag_name(flag: str) -> str:
+    return flag.strip().lstrip("-").lower()
+
+
+def _get_extra_arg(extra_args: dict[str, str], flag_name: str) -> str | None:
+    wanted = _normalize_flag_name(flag_name)
+    for key, value in extra_args.items():
+        if _normalize_flag_name(str(key)) == wanted:
+            return None if value is None else str(value)
+    return None
+
+
+def _set_extra_arg(extra_args: dict[str, str], flag_name: str, value: str) -> None:
+    wanted = _normalize_flag_name(flag_name)
+    for key in list(extra_args.keys()):
+        if _normalize_flag_name(str(key)) == wanted:
+            extra_args[key] = value
+            return
+    extra_args[f"--{wanted}"] = value
+
+
+def _looks_like_gguf_model(model_id: str, extra_args: dict[str, str]) -> bool:
+    lowered = model_id.lower()
+    if lowered.endswith(".gguf"):
+        return True
+    if "gguf" in lowered.split("/")[-1]:
+        return True
+    return (_get_extra_arg(extra_args, "load-format") or "").lower() == "gguf"
+
+
+def _extract_base_model_candidates_from_card_data(card_data: object) -> list[str]:
+    if not isinstance(card_data, dict):
+        return []
+
+    base = card_data.get("base_model")
+    if isinstance(base, str) and base.strip():
+        return [base.strip()]
+    if isinstance(base, list):
+        return [str(item).strip() for item in base if str(item).strip()]
+    return []
+
+
+def _guess_same_author_base_model(model_id: str) -> str | None:
+    if "/" not in model_id:
+        return None
+    author, repo = model_id.split("/", 1)
+    base_repo = re.sub(r"(?i)[-_\.]*gguf$", "", repo).strip("-_.")
+    if not base_repo or base_repo == repo:
+        return None
+    return f"{author}/{base_repo}"
+
+
+def _repo_has_tokenizer_files(api: HfApi, repo_id: str) -> bool:
+    try:
+        info = api.model_info(repo_id)
+    except HfHubHTTPError:
+        return False
+    except Exception:
+        return False
+
+    siblings = getattr(info, "siblings", None) or []
+    tokenizer_markers = (
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json",
+        "spiece.model",
+        "vocab.json",
+        "merges.txt",
+    )
+    for item in siblings:
+        filename = (getattr(item, "rfilename", "") or "").lower()
+        if any(filename.endswith(marker) for marker in tokenizer_markers):
+            return True
+    return False
+
+
+def _repo_is_gated(api: HfApi, repo_id: str) -> bool:
+    try:
+        info = api.model_info(repo_id)
+    except Exception:
+        return False
+    gated = getattr(info, "gated", False)
+    return bool(gated)
+
+
+def _infer_tokenizer_repo_for_gguf(model_id: str) -> str | None:
+    api = HfApi(token=settings.hf_token or None)
+    candidates: list[str] = []
+
+    same_author = _guess_same_author_base_model(model_id)
+    if same_author:
+        candidates.append(same_author)
+
+    try:
+        info = api.model_info(model_id)
+        card_data = getattr(info, "cardData", None)
+        candidates.extend(_extract_base_model_candidates_from_card_data(card_data))
+
+        tags = getattr(info, "tags", None) or []
+        for tag in tags:
+            if isinstance(tag, str) and tag.startswith("base_model:"):
+                base = tag.split(":", 1)[1].strip()
+                if base:
+                    candidates.append(base)
+    except Exception:
+        pass
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if _repo_has_tokenizer_files(api, candidate):
+            return candidate
+
+    return None
+
+
+def _prepare_extra_args_for_model(model_id: str, raw_extra_args: dict[str, str] | None) -> dict[str, str]:
+    extra_args: dict[str, str] = dict(raw_extra_args or {})
+    if not _looks_like_gguf_model(model_id, extra_args):
+        return extra_args
+
+    if not _get_extra_arg(extra_args, "load-format"):
+        _set_extra_arg(extra_args, "load-format", "gguf")
+
+    tokenizer = _get_extra_arg(extra_args, "tokenizer")
+    if tokenizer:
+        if not _get_extra_arg(extra_args, "hf-config-path"):
+            _set_extra_arg(extra_args, "hf-config-path", tokenizer)
+        return extra_args
+
+    inferred = _infer_tokenizer_repo_for_gguf(model_id)
+    if inferred:
+        api = HfApi(token=settings.hf_token or None)
+        if _repo_is_gated(api, inferred) and not (settings.hf_token or "").strip():
+            raise VllmError(
+                f"Tokenizer repo '{inferred}' is gated. Configure HF_TOKEN with access "
+                "or set extra_args['--tokenizer'] to a non-gated tokenizer repo."
+            )
+        _set_extra_arg(extra_args, "tokenizer", inferred)
+        if not _get_extra_arg(extra_args, "hf-config-path"):
+            _set_extra_arg(extra_args, "hf-config-path", inferred)
+        logger.info("gguf_tokenizer_inferred", model_id=model_id, tokenizer=inferred)
+        return extra_args
+
+    raise VllmError(
+        "GGUF model detected but tokenizer could not be inferred automatically. "
+        "Set extra_args with '--tokenizer' (for example: {'--load-format': 'gguf', '--tokenizer': 'google/gemma-3-12b-it'})."
+    )
+
+
+def _apply_startup_stability_defaults(raw_extra_args: dict[str, str] | None) -> dict[str, str]:
+    """Apply safe startup defaults unless the user explicitly configured them."""
+    extra_args: dict[str, str] = dict(raw_extra_args or {})
+
+    # Avoid long first-start compilation stalls on some setups.
+    # Users can override with --enforce-eager=false in extra_args.
+    if _get_extra_arg(extra_args, "enforce-eager") is None:
+        _set_extra_arg(extra_args, "enforce-eager", "true")
+
+    return extra_args
+
+
+def _extract_repo_id_for_gguf_reference(model_id: str) -> str | None:
+    # Already explicit references accepted by vLLM.
+    if model_id.endswith(".gguf") or ":" in model_id:
+        return None
+    if model_id.count("/") != 1:
+        return None
+    return model_id
+
+
+def _select_preferred_gguf_filename(files: list[str]) -> str | None:
+    if not files:
+        return None
+
+    # Prefer practical defaults first to reduce OOM risk on common single-GPU setups.
+    preferred_markers = (
+        "q4_k_m",
+        "q5_k_m",
+        "q4_k_s",
+        "q5_k_s",
+        "q6_k",
+        "q8_0",
+        "f16",
+        "bf16",
+    )
+
+    lowered = [(name, name.lower()) for name in files]
+    for marker in preferred_markers:
+        for original, candidate in lowered:
+            if marker in candidate:
+                return original
+
+    # Fallback: deterministic order.
+    return sorted(files)[0]
+
+
+def _prepare_model_reference_for_vllm(model_id: str, extra_args: dict[str, str]) -> str:
+    if not _looks_like_gguf_model(model_id, extra_args):
+        return model_id
+
+    repo_id = _extract_repo_id_for_gguf_reference(model_id)
+    if repo_id is None:
+        return model_id
+
+    api = HfApi(token=settings.hf_token or None)
+    try:
+        info = api.model_info(repo_id)
+    except Exception as exc:
+        raise VllmError(f"Failed to inspect GGUF repo '{repo_id}': {exc}") from exc
+
+    siblings = getattr(info, "siblings", None) or []
+    sibling_names = [str(getattr(item, "rfilename", "")) for item in siblings]
+    has_config_json = any(name == "config.json" for name in sibling_names)
+    gguf_files = [
+        name
+        for name in sibling_names
+        if name.lower().endswith(".gguf")
+    ]
+
+    if not gguf_files:
+        raise VllmError(
+            f"Model '{repo_id}' was detected as GGUF but no .gguf files were found. "
+            "Use a GGUF repo/file reference like '<repo>/<file>.gguf'."
+        )
+
+    if not has_config_json:
+        hf_config_path = _get_extra_arg(extra_args, "hf-config-path") or ""
+        raise VllmError(
+            "This GGUF repo does not include config.json, which currently breaks vLLM 0.16 "
+            "during startup speculator detection. "
+            f"Repo: '{repo_id}'. "
+            f"Configured --hf-config-path: '{hf_config_path or 'not set'}'. "
+            "Use a GGUF repo that includes config.json or switch to a non-GGUF model/repository."
+        )
+
+    chosen = _select_preferred_gguf_filename(gguf_files)
+    if not chosen:
+        raise VllmError(f"Could not select a GGUF file from repo '{repo_id}'.")
+
+    resolved = f"{repo_id}/{chosen}"
+    logger.info("gguf_model_reference_resolved", model_id=model_id, resolved_model_id=resolved)
+    return resolved
+
+
+def _build_vllm_args(
+    instance: VllmInstance,
+    *,
+    model_ref: str | None = None,
+    extra_args: dict[str, str] | None = None,
+) -> list[str]:
+    # vLLM >= 0.16 expects model as positional argument for `vllm serve`.
+    args = [model_ref or instance.model_id, "--host", "0.0.0.0", "--port", str(instance.internal_port)]
     args += ["--tensor-parallel-size", str(instance.tensor_parallel_size)]
     args += ["--gpu-memory-utilization", str(instance.gpu_memory_utilization)]
     if instance.max_model_len:
@@ -51,13 +344,59 @@ def _build_vllm_args(instance: VllmInstance) -> list[str]:
     if instance.quantization:
         args += ["--quantization", instance.quantization]
     args += ["--dtype", instance.dtype]
-    if instance.extra_args:
-        for k, v in instance.extra_args.items():
+    effective_extra_args = extra_args if extra_args is not None else (instance.extra_args or {})
+    if effective_extra_args:
+        for k, v in effective_extra_args.items():
             args.append(k)
             # Boolean flags (value is true/True/null/"") have no positional arg
             if v is not None and str(v).lower() not in ("true", "", "1", "yes"):
                 args.append(str(v))
     return args
+
+
+def _build_docker_run_equivalent(
+    *,
+    container_name: str,
+    instance: VllmInstance,
+    vllm_cmd: list[str],
+    nvidia_devices: list[str],
+    gpu_str: str,
+    driver_lib_volumes: dict[str, dict[str, str]],
+) -> str:
+    cmd: list[str] = [
+        "docker",
+        "run",
+        "--detach",
+        "--name",
+        container_name,
+        "--network",
+        settings.docker_network,
+        "--restart",
+        "unless-stopped",
+    ]
+
+    for dev in nvidia_devices:
+        cmd.extend(["--device", dev])
+
+    cmd.extend(["--env", f"NVIDIA_VISIBLE_DEVICES={gpu_str}"])
+    cmd.extend(["--env", f"CUDA_VISIBLE_DEVICES={gpu_str}"])
+    cmd.extend(
+        [
+            "--publish",
+            f"{settings.vllm_bind_host}:{instance.internal_port}:{instance.internal_port}/tcp",
+        ]
+    )
+    cmd.extend(["--volume", f"{settings.hf_cache_dir}:/root/.cache/huggingface:rw"])
+
+    for host_path, bind_conf in driver_lib_volumes.items():
+        bind = bind_conf.get("bind", "")
+        mode = bind_conf.get("mode", "rw")
+        cmd.extend(["--volume", f"{host_path}:{bind}:{mode}"])
+
+    cmd.append(settings.vllm_docker_image)
+    cmd.extend(vllm_cmd)
+
+    return " ".join(shlex.quote(part) for part in cmd)
 
 
 # ── CRUD ──────────────────────────────────────────────────────────────────────
@@ -158,6 +497,18 @@ async def start_instance(db: AsyncSession, instance_id: int) -> VllmInstance:
     if settings.vllm_bind_host != "127.0.0.1":
         raise ValueError("vllm_bind_host MUST be 127.0.0.1")
 
+    docker_reserved = _docker_reserved_ports()
+    if instance.internal_port in docker_reserved or not _port_is_free(instance.internal_port):
+        old_port = instance.internal_port
+        instance.internal_port = await allocate_port(db)
+        logger.warning(
+            "vllm_port_reassigned_before_start",
+            instance_id=instance.id,
+            slug=instance.slug,
+            old_port=old_port,
+            new_port=instance.internal_port,
+        )
+
     instance.status = "starting"
     await db.commit()
 
@@ -204,25 +555,46 @@ async def start_instance(db: AsyncSession, instance_id: int) -> VllmInstance:
         for name in _driver_so_names
     }
 
-    vllm_cmd = _build_vllm_args(instance)
-    logger.info(
-        "vllm_command",
-        instance_id=instance.id,
-        slug=instance.slug,
-        command=" ".join(["vllm", "serve"] + vllm_cmd),
-    )
+    container_env: dict[str, str] = {
+        "NVIDIA_VISIBLE_DEVICES": gpu_str,
+        "CUDA_VISIBLE_DEVICES": gpu_str,
+    }
+    hf_token = (settings.hf_token or "").strip()
+    if hf_token:
+        # Expose token names commonly read by huggingface_hub/transformers in vLLM runtime.
+        container_env["HF_TOKEN"] = hf_token
+        container_env["HUGGING_FACE_HUB_TOKEN"] = hf_token
 
     try:
+        prepared_extra_args = _prepare_extra_args_for_model(instance.model_id, instance.extra_args)
+        prepared_extra_args = _apply_startup_stability_defaults(prepared_extra_args)
+        model_ref = _prepare_model_reference_for_vllm(instance.model_id, prepared_extra_args)
+        vllm_cmd = _build_vllm_args(instance, model_ref=model_ref, extra_args=prepared_extra_args)
+        serve_command = " ".join(shlex.quote(part) for part in ["vllm", "serve", *vllm_cmd])
+        docker_run_command = _build_docker_run_equivalent(
+            container_name=container_name,
+            instance=instance,
+            vllm_cmd=vllm_cmd,
+            nvidia_devices=nvidia_devices,
+            gpu_str=gpu_str,
+            driver_lib_volumes=_driver_lib_volumes,
+        )
+
+        logger.info(
+            "vllm_command",
+            instance_id=instance.id,
+            slug=instance.slug,
+            serve_command=serve_command,
+            docker_run_command=docker_run_command,
+        )
+
         container = client.containers.run(
             image=settings.vllm_docker_image,
             command=vllm_cmd,
             detach=True,
             name=f"vllm_{instance.slug}",
             devices=nvidia_devices,
-            environment={
-                "NVIDIA_VISIBLE_DEVICES": gpu_str,
-                "CUDA_VISIBLE_DEVICES": gpu_str,
-            },
+            environment=container_env,
             ports={f"{instance.internal_port}/tcp": ("127.0.0.1", instance.internal_port)},
             volumes={
                 settings.hf_cache_dir: {"bind": "/root/.cache/huggingface", "mode": "rw"},

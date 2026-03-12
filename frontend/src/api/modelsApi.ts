@@ -9,6 +9,8 @@ export interface HFModelInfo {
   tags: string[]
   last_modified: string | null
   vram_required_gb: number | null
+  supports_image: boolean
+  capabilities: string[]
 }
 
 export interface LocalModelInfo {
@@ -35,8 +37,8 @@ export interface SwitchModelRequest {
 }
 
 export const modelsApi = {
-  available: async (query = '', limit = 20, sort = 'downloads'): Promise<HFModelInfo[]> => {
-    const { data } = await api.get<HFModelInfo[]>('/models/available', { params: { query, limit, sort } })
+  available: async (query = '', limit = 20, sort = 'downloads', task = 'all'): Promise<HFModelInfo[]> => {
+    const { data } = await api.get<HFModelInfo[]>('/models/available', { params: { query, limit, sort, task } })
     return data
   },
   local: async (): Promise<LocalModelInfo[]> => {
