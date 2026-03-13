@@ -8,6 +8,7 @@ export interface HFModelInfo {
   likes: number
   tags: string[]
   last_modified: string | null
+  parameter_count_b: number | null
   vram_required_gb: number | null
   supports_image: boolean
   capabilities: string[]

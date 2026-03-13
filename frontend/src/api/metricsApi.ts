@@ -23,6 +23,7 @@ export interface InstanceMetrics {
   gpu_utilization_pct: number | null
   gpu_memory_used_mb: number | null
   gpu_memory_total_mb: number | null
+  gpu_memory_by_index_mb: Record<string, number> | null
   tokens_per_second: number | null
   avg_latency_ms: number | null
   queue_depth: number

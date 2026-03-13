@@ -28,6 +28,7 @@ class InstanceMetrics(BaseModel):
     gpu_utilization_pct: float | None = None
     gpu_memory_used_mb: float | None = None
     gpu_memory_total_mb: float | None = None
+    gpu_memory_by_index_mb: dict[int, float] | None = None
     tokens_per_second: float | None = None
     avg_latency_ms: float | None = None
     queue_depth: int = 0

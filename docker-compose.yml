@@ -37,6 +37,7 @@ services:
     build:
       context: ./backend
       target: runtime
+    pid: host
     restart: unless-stopped
     env_file: .env
     ports:
@@ -44,6 +45,14 @@ services:
     volumes:
       - hf_cache:${HF_CACHE_DIR:-/home/vllm/.cache/huggingface}
       - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro
+      - /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:ro
+    devices:
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidia1:/dev/nvidia1
     depends_on:
       postgres:
         condition: service_healthy
@@ -81,6 +90,7 @@ services:
     env_file: .env
     volumes:
       - hf_cache:${HF_CACHE_DIR:-/home/vllm/.cache/huggingface}
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       postgres:
         condition: service_healthy

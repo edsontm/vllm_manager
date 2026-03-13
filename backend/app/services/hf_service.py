@@ -29,19 +29,43 @@ def _estimate_vram_gb(siblings) -> float | None:
     return round((total_bytes / 1e9) * 1.2, 1)
 
 
+def _extract_params_b_from_name(model_id: str) -> float | None:
+    """Parse parameter count from model name (examples: 7B, 1.5B, 405B)."""
+    import re
+
+    tail = model_id.split("/")[-1]
+    match = re.search(r"(\d+(?:\.\d+)?)\s*[Bb](?:[^a-zA-Z]|$)", tail)
+    if not match:
+        return None
+    return float(match.group(1))
+
+
+def _estimate_parameter_count_b(siblings, model_id: str, safetensors_info: object | None = None) -> float | None:
+    """Estimate parameters in billions from safetensors size or model name fallback."""
+    total_from_safetensors = getattr(safetensors_info, "total", None)
+    if isinstance(total_from_safetensors, (int, float)) and total_from_safetensors > 0:
+        return round(float(total_from_safetensors) / 1e9, 1)
+
+    total_bytes = sum(
+        getattr(s, "size", 0) or 0
+        for s in (siblings or [])
+        if getattr(s, "rfilename", "").endswith(".safetensors")
+    )
+    if total_bytes > 0:
+        # Default BF16/FP16 weight size ~= 2 bytes per parameter.
+        return round((total_bytes / 2) / 1e9, 1)
+    return _extract_params_b_from_name(model_id)
+
+
 def _estimate_vram_from_name(model_id: str) -> float | None:
     """
     Estimate VRAM from the parameter count embedded in the model name.
     Matches patterns like 7B, 8b, 1.5B, 70B, 405B in the model id tail.
     Formula: params_in_billions * 2 bytes (BF16) * 1.2 overhead → GB.
     """
-    import re
-    tail = model_id.split("/")[-1]
-    # Match e.g. "7B", "8b", "1.5B", "70B", "0.5b", "405B"
-    m = re.search(r"(\d+(?:\.\d+)?)\s*[Bb](?:[^a-zA-Z]|$)", tail)
-    if not m:
+    params_b = _extract_params_b_from_name(model_id)
+    if params_b is None:
         return None
-    params_b = float(m.group(1))
     # 2 bytes per param (BF16) + 20% overhead for KV cache / activations
     vram_gb = params_b * 2 * 1.2
     return round(vram_gb, 1)
@@ -179,6 +203,7 @@ def _extract_base_model_candidates(info: object) -> list[str]:
 
 # Multimodal architectures that support image inputs
 _MULTIMODAL_ARCHITECTURES: frozenset[str] = frozenset({
+    "Florence2ForConditionalGeneration",
     "LlavaNextForConditionalGeneration",
     "LlavaForConditionalGeneration",
     "LlavaMistralForConditionalGeneration",
@@ -196,6 +221,11 @@ _MULTIMODAL_ARCHITECTURES: frozenset[str] = frozenset({
     "DeepseekVLForCausalLM",
     "Qwen3ForCausalLM",  # Some Qwen3 versions support vision
     "CharacterGLMForCausalLM",
+})
+
+_COMPATIBLE_ARCHITECTURE_OVERRIDES: frozenset[str] = frozenset({
+    # vLLM supports Florence-2, but this architecture may lag in static registries.
+    "Florence2ForConditionalGeneration",
 })
 
 _KNOWN_PIPELINE_TAGS: frozenset[str] = frozenset({
@@ -275,12 +305,32 @@ def _infer_capabilities(info: object) -> list[str]:
     return deduped
 
 
+def _matches_compatibility_override(info: object) -> bool:
+    model_config = getattr(info, "config", None) or {}
+    architectures: list[str] = model_config.get("architectures", []) if isinstance(model_config, dict) else []
+    if any(arch in _COMPATIBLE_ARCHITECTURE_OVERRIDES for arch in architectures):
+        return True
+
+    model_id = (getattr(info, "id", "") or "").lower()
+    if model_id.startswith("microsoft/florence-2"):
+        return True
+
+    tags = {str(tag).lower() for tag in (getattr(info, "tags", None) or [])}
+    if "vllm" in tags or "vllm-compatible" in tags:
+        return True
+
+    return False
+
+
 def _is_model_compatible(info: object, api: HfApi, tokenizer_repo_cache: dict[str, bool]) -> bool:
     # Primary check: use architectures from config.json to match against vLLM whitelist.
     model_config = getattr(info, "config", None) or {}
     architectures: list[str] = model_config.get("architectures", []) if isinstance(model_config, dict) else []
     if architectures:
-        return any(arch in _VLLM_SUPPORTED_ARCHITECTURES for arch in architectures)
+        if any(arch in _VLLM_SUPPORTED_ARCHITECTURES for arch in architectures):
+            return True
+        if _matches_compatibility_override(info):
+            return True
 
     # Fallback for models without an architectures field (e.g. GGUF-only repos):
     # require at least safetensors/pytorch weights + config.json.
@@ -291,6 +341,9 @@ def _is_model_compatible(info: object, api: HfApi, tokenizer_repo_cache: dict[st
     has_pytorch_bin = any(n.endswith("pytorch_model.bin") or n.endswith("pytorch_model.bin.index.json") for n in lowered)
     if has_safetensors or has_pytorch_bin:
         return has_config
+
+    if _matches_compatibility_override(info):
+        return True
 
     return False
 
@@ -318,7 +371,7 @@ async def list_models(
 
     for m in models:
         try:
-            info = api.model_info(m.id)
+            info = api.model_info(m.id, files_metadata=True)
         except HfHubHTTPError:
             continue
         except Exception:
@@ -336,6 +389,11 @@ async def list_models(
                 likes=info.likes or 0,
                 tags=list(info.tags or []),
                 last_modified=str(info.last_modified) if info.last_modified else None,
+                parameter_count_b=_estimate_parameter_count_b(
+                    getattr(info, "siblings", None),
+                    info.id,
+                    getattr(info, "safetensors", None),
+                ),
                 vram_required_gb=(
                     _estimate_vram_gb(getattr(info, "siblings", None))
                     or _estimate_vram_from_name(info.id)
@@ -350,7 +408,7 @@ async def list_models(
 
 async def model_info(model_id: str) -> HFModelInfo:
     try:
-        info = _get_api().model_info(model_id)
+        info = _get_api().model_info(model_id, files_metadata=True)
     except HfHubHTTPError as exc:
         raise HuggingFaceError(str(exc)) from exc
 
@@ -362,6 +420,11 @@ async def model_info(model_id: str) -> HFModelInfo:
         likes=info.likes or 0,
         tags=list(info.tags or []),
         last_modified=str(info.last_modified) if info.last_modified else None,
+        parameter_count_b=_estimate_parameter_count_b(
+            getattr(info, "siblings", None),
+            info.id,
+            getattr(info, "safetensors", None),
+        ),
         vram_required_gb=(
             _estimate_vram_gb(getattr(info, "siblings", None))
             or _estimate_vram_from_name(info.id)

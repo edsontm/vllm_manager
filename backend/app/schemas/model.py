@@ -11,6 +11,7 @@ class HFModelInfo(BaseModel):
     likes: int = 0
     tags: list[str] = []
     last_modified: str | None = None
+    parameter_count_b: float | None = None
     vram_required_gb: float | None = None
     supports_image: bool = False
     capabilities: list[str] = []

@@ -5,7 +5,7 @@ import { instancesApi, type InstanceRead, type InstanceCreate } from '@/api/inst
 import { metricsApi, type GpuInfo, type InstanceMetrics } from '@/api/metricsApi'
 import { useAuthStore } from '@/store'
 import CodeExample from '@/components/CodeExample'
-import { Play, Square, RefreshCw, Trash2, Plus, ChevronDown, Pencil, Cpu } from 'lucide-react'
+import { Play, Square, RefreshCw, Trash2, Plus, ChevronDown, Pencil, Cpu, FileText } from 'lucide-react'
 
 const toGb = (mb: number) => (mb / 1024).toFixed(1)
 
@@ -23,6 +23,55 @@ function ResourceBar({ used, total, label }: { used: number; total: number; labe
       <span className="font-mono text-[10px] text-gray-400 whitespace-nowrap">
         {toGb(used)} / {toGb(safeTotal)} GB <span className="text-gray-600">({pct}%)</span>
       </span>
+    </div>
+  )
+}
+
+function InstanceUsageBar({ used, total, label }: { used: number; total?: number | null; label: string }) {
+  const safeTotal = total != null && total > 0 ? total : used
+  const pct = safeTotal > 0 ? Math.min(100, Math.round((used / safeTotal) * 100)) : 0
+  const color = pct > 90 ? 'bg-red-500' : pct > 70 ? 'bg-yellow-500' : 'bg-cyan-500'
+
+  return (
+    <div className="bg-gray-950/60 border border-gray-800 rounded-lg px-3 py-2 space-y-1.5">
+      <div className="flex items-center justify-between gap-3">
+        <span className="font-mono text-[10px] text-gray-500 uppercase">{label}</span>
+        <span className="font-mono text-[10px] text-gray-300 whitespace-nowrap">
+          {toGb(used)} / {toGb(safeTotal)} GB <span className="text-gray-600">({pct}%)</span>
+        </span>
+      </div>
+      <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
+        <div className={`h-full rounded-full transition-all duration-700 ${color}`} style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  )
+}
+
+function InstanceGpuBreakdown({
+  hostGpus,
+  memoryByGpuIndex,
+}: {
+  hostGpus: GpuInfo[]
+  memoryByGpuIndex?: Record<string, number> | null
+}) {
+  if (!hostGpus.length) return null
+
+  return (
+    <div className="space-y-2">
+      <p className="font-mono text-[10px] text-gray-500 uppercase">Instance GPU Consumption</p>
+      {hostGpus.map((gpu) => {
+        const byStringKey = memoryByGpuIndex?.[String(gpu.index)]
+        const byNumberKey = memoryByGpuIndex?.[gpu.index as unknown as keyof Record<string, number>]
+        const used = byStringKey ?? byNumberKey ?? 0
+        return (
+          <ResourceBar
+            key={gpu.index}
+            used={used}
+            total={gpu.memory_total_mb}
+            label={`GPU ${gpu.index}`}
+          />
+        )
+      })}
     </div>
   )
 }
@@ -145,26 +194,6 @@ function ResourceSummaryPanel({
   )
 }
 
-// ── Instance VRAM bar ─────────────────────────────────────────────────────────
-
-function MachineGpuUsage({ gpus }: { gpus: GpuInfo[] }) {
-  if (gpus.length === 0) return null
-
-  return (
-    <div className="space-y-2">
-      <div className="flex items-center justify-between">
-        <span className="font-mono text-[10px] text-gray-500 uppercase">Machine GPU VRAM</span>
-        <span className="font-mono text-[10px] text-gray-600">
-          {gpus.length} GPU{gpus.length === 1 ? '' : 's'} available
-        </span>
-      </div>
-      <div className="flex flex-wrap gap-3">
-        {gpus.map((gpu) => <GpuBar key={gpu.index} gpu={gpu} />)}
-      </div>
-    </div>
-  )
-}
-
 // ── Log panel ─────────────────────────────────────────────────────────────────
 
 function LogPanel({ instanceId, trigger }: { instanceId: number; trigger: number }) {
@@ -212,6 +241,9 @@ type FormState = {
 
 const DTYPE_OPTIONS = ['auto', 'float16', 'bfloat16', 'float32']
 const QUANT_OPTIONS = ['', 'awq', 'gptq', 'squeezellm', 'fp8']
+const DEFAULT_CREATE_EXTRA_ARGS: Record<string, string> = {
+  '--enable-prefix-caching': 'true',
+}
 
 function toFormState(instance?: InstanceRead | null, prefill?: { model_id: string; slug: string; display_name: string }): FormState {
   if (instance) {
@@ -240,7 +272,7 @@ function toFormState(instance?: InstanceRead | null, prefill?: { model_id: strin
     tensor_parallel_size: '1',
     dtype: 'auto',
     quantization: '',
-    extra_args: '',
+    extra_args: JSON.stringify(DEFAULT_CREATE_EXTRA_ARGS, null, 2),
   }
 }
 
@@ -402,7 +434,7 @@ function InstanceForm({ instance, prefill, onClose, onSaved }: InstanceFormProps
             value={form.extra_args}
             onChange={set('extra_args')}
             className={inputCls + ' resize-y font-mono' + (extraArgsError ? ' border-red-600' : '')}
-            placeholder={'{\n  "--enforce-eager": "true",\n  "--max-num-seqs": "8"\n}'}
+            placeholder={'{\n  "--enable-prefix-caching": "true"\n}'}
           />
           {extraArgsError
             ? <p className="text-[10px] text-red-400 mt-0.5">{extraArgsError}</p>
@@ -449,7 +481,7 @@ const STATUS_COLOR: Record<string, string> = {
 
 // ── Instance row ──────────────────────────────────────────────────────────────
 
-function InstanceRow({ instance, metrics, machineGpus = [] }: { instance: InstanceRead; metrics?: InstanceMetrics; machineGpus?: GpuInfo[] }) {
+function InstanceRow({ instance, metrics, hostGpus = [] }: { instance: InstanceRead; metrics?: InstanceMetrics; hostGpus?: GpuInfo[] }) {
   const qc = useQueryClient()
   const isAdmin = useAuthStore((s) => s.currentUser?.role === 'admin')
   const [showExamples, setShowExamples] = useState(false)
@@ -530,17 +562,28 @@ function InstanceRow({ instance, metrics, machineGpus = [] }: { instance: Instan
         )}
       </div>
 
-      {/* VRAM bar (running instances with live data) */}
-      {instance.status === 'running' && metrics?.gpu_memory_used_mb != null && metrics?.gpu_memory_total_mb != null && (
-        <ResourceBar used={metrics.gpu_memory_used_mb} total={metrics.gpu_memory_total_mb} label="Observed VRAM" />
+      {/* Per-instance live resource usage */}
+      {instance.status === 'running' && metrics?.gpu_memory_used_mb != null && (
+        <InstanceUsageBar
+          used={metrics.gpu_memory_used_mb}
+          total={metrics.gpu_memory_total_mb}
+          label="Instance VRAM"
+        />
       )}
 
-      {instance.status === 'running' && metrics?.system_memory_used_mb != null && metrics?.system_memory_total_mb != null && (
-        <ResourceBar used={metrics.system_memory_used_mb} total={metrics.system_memory_total_mb} label="Container RAM" />
+      {instance.status === 'running' && metrics?.system_memory_used_mb != null && (
+        <InstanceUsageBar
+          used={metrics.system_memory_used_mb}
+          total={metrics.system_memory_total_mb}
+          label="Instance RAM"
+        />
       )}
 
-      {instance.status === 'running' && machineGpus.length > 0 && (
-        <MachineGpuUsage gpus={machineGpus} />
+      {instance.status === 'running' && (
+        <InstanceGpuBreakdown
+          hostGpus={hostGpus}
+          memoryByGpuIndex={metrics?.gpu_memory_by_index_mb}
+        />
       )}
 
       {/* Error message from crashed container */}
@@ -574,6 +617,9 @@ function InstanceRow({ instance, metrics, machineGpus = [] }: { instance: Instan
             </button>
             <button onClick={() => { setActionError(null); setShowEdit((v) => !v) }} className="flex items-center gap-1 text-xs bg-indigo-800 hover:bg-indigo-700 text-white px-3 py-1 rounded transition-colors">
               <Pencil size={12} /> Edit
+            </button>
+            <button onClick={() => { setActionError(null); openLogs() }} className="flex items-center gap-1 text-xs bg-slate-800 hover:bg-slate-700 text-white px-3 py-1 rounded transition-colors">
+              <FileText size={12} /> Logs
             </button>
             {confirmDelete ? (
               <span className="flex items-center gap-2 ml-auto">
@@ -721,7 +767,7 @@ export default function Instances() {
               key={inst.id}
               instance={inst}
               metrics={metricsById[inst.id]}
-              machineGpus={gpuSummary?.gpus ?? []}
+              hostGpus={gpuSummary?.gpus ?? []}
             />
           ))}
         </div>

@@ -197,6 +197,27 @@ async def _reconcile_container_statuses(
                 and restart_count >= _CRASH_LOOP_THRESHOLD
             )
 
+            if docker_status == "running" and instance.status == "starting":
+                try:
+                    networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+                    net = networks.get(settings.docker_network, {}) if isinstance(networks, dict) else {}
+                    ip = net.get("IPAddress") if isinstance(net, dict) else None
+                    if ip:
+                        async with httpx.AsyncClient(timeout=2.0) as hc:
+                            resp = await hc.get(f"http://{ip}:{instance.internal_port}/health")
+                        if resp.status_code == 200:
+                            async with Session() as db:
+                                result = await db.execute(
+                                    select(VllmInstance).where(VllmInstance.id == instance.id)
+                                )
+                                inst = result.scalar_one_or_none()
+                                if inst and inst.status == "starting":
+                                    inst.status = "running"
+                                    await db.commit()
+                except Exception:
+                    # Still starting or transient network issue.
+                    pass
+
             if is_crashed or is_crash_loop:
                 # Grab the last lines of logs as the error message
                 try:

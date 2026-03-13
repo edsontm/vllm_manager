@@ -95,7 +95,16 @@ function vramChip(gb: number | null) {
   return (
     <span className="inline-flex items-center gap-1 bg-amber-950 text-amber-400 font-mono font-[600] text-xs px-2 py-0.5 rounded">
       <Cpu size={10} />
-      ~{gb} GB VRAM
+      ~{gb} GB VRAM (default)
+    </span>
+  )
+}
+
+function paramsChip(paramsB: number | null) {
+  if (paramsB === null) return null
+  return (
+    <span className="inline-flex items-center gap-1 bg-indigo-950 text-indigo-300 font-mono font-[600] text-xs px-2 py-0.5 rounded">
+      {paramsB}B params
     </span>
   )
 }
@@ -153,6 +162,7 @@ function ModelCard({ model }: { model: HFModelInfo }) {
       <div className="flex flex-wrap gap-2 items-center mt-1">
         <span className="font-mono font-[600] text-xs text-gray-500">↓ {model.downloads.toLocaleString()}</span>
         <span className="font-mono font-[600] text-xs text-gray-500">♡ {model.likes.toLocaleString()}</span>
+        {paramsChip(model.parameter_count_b)}
         {vramChip(model.vram_required_gb)}
         {model.capabilities.map((capability) => <CapabilityChip key={capability} capability={capability} />)}
       </div>

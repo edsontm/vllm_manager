@@ -67,6 +67,36 @@ def _docker_reserved_ports() -> set[int]:
         return set()
 
 
+def _resolve_container_ip(container_id: str | None) -> str | None:
+    if not container_id:
+        return None
+    try:
+        container = _get_docker().containers.get(container_id)
+    except Exception:
+        return None
+
+    networks = (container.attrs.get("NetworkSettings", {}) or {}).get("Networks", {}) or {}
+    preferred = networks.get(settings.docker_network, {})
+    ip = preferred.get("IPAddress") if isinstance(preferred, dict) else None
+    if ip:
+        return ip
+
+    for net in networks.values():
+        ip = (net or {}).get("IPAddress")
+        if ip:
+            return ip
+    return None
+
+
+def _candidate_health_urls(instance: VllmInstance) -> list[str]:
+    urls: list[str] = []
+    container_ip = _resolve_container_ip(instance.container_id)
+    if container_ip:
+        urls.append(f"http://{container_ip}:{instance.internal_port}/health")
+    urls.append(f"http://127.0.0.1:{instance.internal_port}/health")
+    return list(dict.fromkeys(urls))
+
+
 async def allocate_port(db: AsyncSession) -> int:
     result = await db.execute(select(VllmInstance.internal_port))
     used = {row[0] for row in result.all()}
@@ -243,6 +273,14 @@ def _apply_startup_stability_defaults(raw_extra_args: dict[str, str] | None) -> 
     if _get_extra_arg(extra_args, "enforce-eager") is None:
         _set_extra_arg(extra_args, "enforce-eager", "true")
 
+    # Improve cache hit efficiency for repeated prompts.
+    if _get_extra_arg(extra_args, "enable-prefix-caching") is None:
+        _set_extra_arg(extra_args, "enable-prefix-caching", "true")
+
+    # Reduce KV-cache memory footprint by default.
+    if _get_extra_arg(extra_args, "kv-cache-dtype") is None:
+        _set_extra_arg(extra_args, "kv-cache-dtype", "fp8")
+
     return extra_args
 
 
@@ -354,13 +392,34 @@ def _build_vllm_args(
     return args
 
 
+def _build_container_gpu_device_config(gpu_indices: list[int]) -> tuple[list[str], str, str]:
+    """Map host GPU ids to contiguous in-container indices for CUDA/NVML.
+
+    When only a subset of `/dev/nvidia*` nodes is mounted into the container,
+    libraries inside the container should see them as a dense 0..N-1 range.
+    """
+    resolved_gpu_indices = list(gpu_indices) if gpu_indices else [0]
+    host_gpu_str = ",".join(str(gpu) for gpu in resolved_gpu_indices)
+    container_visible_gpu_str = ",".join(str(idx) for idx, _ in enumerate(resolved_gpu_indices))
+    always_devices = [
+        "/dev/nvidiactl:/dev/nvidiactl:rwm",
+        "/dev/nvidia-uvm:/dev/nvidia-uvm:rwm",
+        "/dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools:rwm",
+    ]
+    gpu_devices = [
+        f"/dev/nvidia{host_idx}:/dev/nvidia{container_idx}:rwm"
+        for container_idx, host_idx in enumerate(resolved_gpu_indices)
+    ]
+    return always_devices + gpu_devices, host_gpu_str, container_visible_gpu_str
+
+
 def _build_docker_run_equivalent(
     *,
     container_name: str,
     instance: VllmInstance,
     vllm_cmd: list[str],
     nvidia_devices: list[str],
-    gpu_str: str,
+    container_gpu_str: str,
     driver_lib_volumes: dict[str, dict[str, str]],
 ) -> str:
     cmd: list[str] = [
@@ -378,8 +437,8 @@ def _build_docker_run_equivalent(
     for dev in nvidia_devices:
         cmd.extend(["--device", dev])
 
-    cmd.extend(["--env", f"NVIDIA_VISIBLE_DEVICES={gpu_str}"])
-    cmd.extend(["--env", f"CUDA_VISIBLE_DEVICES={gpu_str}"])
+    cmd.extend(["--env", f"NVIDIA_VISIBLE_DEVICES={container_gpu_str}"])
+    cmd.extend(["--env", f"CUDA_VISIBLE_DEVICES={container_gpu_str}"])
     cmd.extend(
         [
             "--publish",
@@ -523,16 +582,9 @@ async def start_instance(db: AsyncSession, instance_id: int) -> VllmInstance:
     except docker.errors.NotFound:
         pass  # nothing to clean up
 
-    # Build device list: always include the control/UVM devices, plus per-GPU nvidia<N>
+    # Remap selected host GPUs to a contiguous 0..N-1 set inside the container.
     gpu_indices: list[int] = list(instance.gpu_ids) if instance.gpu_ids else [0]
-    gpu_str = ",".join(str(g) for g in gpu_indices)
-    _always_devs = [
-        "/dev/nvidiactl:/dev/nvidiactl:rwm",
-        "/dev/nvidia-uvm:/dev/nvidia-uvm:rwm",
-        "/dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools:rwm",
-    ]
-    _gpu_devs = [f"/dev/nvidia{i}:/dev/nvidia{i}:rwm" for i in gpu_indices]
-    nvidia_devices = _always_devs + _gpu_devs
+    nvidia_devices, host_gpu_str, container_gpu_str = _build_container_gpu_device_config(gpu_indices)
 
     # Inject only the CUDA driver interface libraries from the HOST into the
     # container so that libcuda.so.1 / libnvidia-ml.so.1 match the kernel
@@ -556,8 +608,8 @@ async def start_instance(db: AsyncSession, instance_id: int) -> VllmInstance:
     }
 
     container_env: dict[str, str] = {
-        "NVIDIA_VISIBLE_DEVICES": gpu_str,
-        "CUDA_VISIBLE_DEVICES": gpu_str,
+        "NVIDIA_VISIBLE_DEVICES": container_gpu_str,
+        "CUDA_VISIBLE_DEVICES": container_gpu_str,
     }
     hf_token = (settings.hf_token or "").strip()
     if hf_token:
@@ -576,7 +628,7 @@ async def start_instance(db: AsyncSession, instance_id: int) -> VllmInstance:
             instance=instance,
             vllm_cmd=vllm_cmd,
             nvidia_devices=nvidia_devices,
-            gpu_str=gpu_str,
+            container_gpu_str=container_gpu_str,
             driver_lib_volumes=_driver_lib_volumes,
         )
 
@@ -584,6 +636,8 @@ async def start_instance(db: AsyncSession, instance_id: int) -> VllmInstance:
             "vllm_command",
             instance_id=instance.id,
             slug=instance.slug,
+            host_gpu_ids=host_gpu_str,
+            visible_gpu_ids=container_gpu_str,
             serve_command=serve_command,
             docker_run_command=docker_run_command,
         )
@@ -605,9 +659,16 @@ async def start_instance(db: AsyncSession, instance_id: int) -> VllmInstance:
             restart_policy={"Name": "unless-stopped"},
         )
         instance.container_id = container.id
-        instance.status = "running"
+        # Mark as starting first; promote to running only when /health is ready.
+        instance.status = "starting"
         await db.commit()
         await db.refresh(instance)
+
+        if await health_check(instance):
+            instance.status = "running"
+            await db.commit()
+            await db.refresh(instance)
+
         logger.info("vllm_started", instance_id=instance.id, container_id=container.id)
         return instance
     except Exception as exc:
@@ -631,9 +692,14 @@ async def get_container_status(db: AsyncSession, instance_id: int) -> InstanceSt
     docker_status: str | None = None
     if instance.container_id:
         docker_status = await _get_docker_status(instance.container_id)
-        if docker_status == "running" and instance.status != "running":
-            instance.status = "running"
-            await db.commit()
+        if docker_status == "running":
+            if await health_check(instance):
+                if instance.status != "running":
+                    instance.status = "running"
+                    await db.commit()
+            elif instance.status != "starting":
+                instance.status = "starting"
+                await db.commit()
         elif docker_status in ("exited", "not_found") and instance.status == "running":
             instance.status = "error"
             await db.commit()
@@ -659,8 +725,14 @@ async def health_check(instance: VllmInstance) -> bool:
     import httpx
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(f"http://127.0.0.1:{instance.internal_port}/health")
-            return r.status_code == 200
+            for url in _candidate_health_urls(instance):
+                try:
+                    r = await client.get(url)
+                except Exception:
+                    continue
+                if r.status_code == 200:
+                    return True
+            return False
     except Exception:
         return False
 
