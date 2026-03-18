@@ -43,7 +43,7 @@ class Settings(BaseSettings):
 
     # Queue
     queue_batch_size: int = 16
-    queue_batch_timeout_ms: int = 200
+    queue_batch_timeout_ms: int = 100
 
     # Metrics
     metrics_poll_interval_s: int = 30

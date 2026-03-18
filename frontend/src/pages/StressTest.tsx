@@ -1,18 +1,19 @@
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { instancesApi } from '@/api/instancesApi'
+import { queueApi } from '@/api/queueApi'
 import { Play, Square, AlertTriangle, KeyRound } from 'lucide-react'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 interface RequestResult {
-  ttft: number | null       // ms to first token
-  itl: number[]             // ms between consecutive tokens
-  e2el: number              // ms total
+  queueWait: number | null    // ms in queue (from result payload)
+  processingTime: number | null // e2el - queueWait
+  e2el: number                 // ms total
   outputTokens: number
   error: string | null
-  sampleError?: string      // first error text to surface to the user
+  sampleError?: string
 }
 
 interface AggStats {
@@ -27,6 +28,7 @@ interface AggStats {
 const REQUEST_TIMEOUT_MS = 120_000
 const RUN_TIMEOUT_MS = 10 * 60_000
 const PREFLIGHT_TIMEOUT_MS = 60_000
+const QUEUE_POLL_INTERVAL_MS = 1_000
 
 // ── Math helpers ──────────────────────────────────────────────────────────────
 
@@ -61,7 +63,7 @@ function normalizeTokenInput(input: string): string {
     .trim()
 }
 
-// ── Single streaming request ──────────────────────────────────────────────────
+// ── Single non-streaming request ─────────────────────────────────────────────
 
 async function runRequest(
   slug: string,
@@ -72,10 +74,6 @@ async function runRequest(
   signal: AbortSignal,
 ): Promise<RequestResult> {
   const start = performance.now()
-  let ttft: number | null = null
-  const tokenTimes: number[] = []
-  let outputTokens = 0
-  let countedCompletionPayload = false
 
   const timeoutCtrl = new AbortController()
   const timeoutId = window.setTimeout(() => timeoutCtrl.abort(), REQUEST_TIMEOUT_MS)
@@ -85,104 +83,58 @@ async function runRequest(
   try {
     const endpointPath = `/v1/${slug}/chat/completions`
 
-    const requestInit: RequestInit = {
+    const res = await fetch(endpointPath, {
       method: 'POST',
       signal: timeoutCtrl.signal,
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ model: modelId, messages, max_tokens: maxTokens, stream: true }),
-    }
+      body: JSON.stringify({ model: modelId, messages, max_tokens: maxTokens, stream: false }),
+    })
 
-    const res = await fetch(endpointPath, requestInit)
+    const e2el = performance.now() - start
 
-    if (!res.ok || !res.body) {
+    if (!res.ok) {
       const errText = await res.text().catch(() => `HTTP ${res.status}`)
       let detail = errText
       try { const j = JSON.parse(errText); detail = j?.detail ?? j?.message ?? j?.error ?? errText } catch {}
-      return { ttft: null, itl: [], e2el: performance.now() - start, outputTokens: 0, error: `HTTP ${res.status}: ${detail}`, sampleError: `HTTP ${res.status}: ${detail}` }
+      return { queueWait: null, processingTime: null, e2el, outputTokens: 0, error: `HTTP ${res.status}: ${detail}`, sampleError: `HTTP ${res.status}: ${detail}` }
     }
 
-    const reader = res.body.getReader()
-    const dec = new TextDecoder()
-    let buf = ''
-    let doneSeen = false
+    const body = await res.json()
 
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (ttft === null) ttft = performance.now() - start
-      buf += dec.decode(value, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop() ?? ''
-      for (const line of lines) {
-        if (!line.startsWith('data:')) continue
-        const raw = line.replace(/^data:\s*/, '').trim()
-        if (raw === '[DONE]') {
-          doneSeen = true
-          break
-        }
-        try {
-          const parsed = JSON.parse(raw)
-          // Detect error wrapped in an SSE frame (e.g. proxy auth failures returning 200+error body)
-          if (parsed?.error || parsed?.detail) {
-            const errMsg = parsed?.detail ?? parsed?.message ?? parsed?.error ?? raw
-            return { ttft, itl: [], e2el: performance.now() - start, outputTokens, error: String(errMsg), sampleError: String(errMsg) }
-          }
-          const now = performance.now()
-          const deltaContent = parsed?.choices?.[0]?.delta?.content
-          if (typeof deltaContent === 'string' && deltaContent.length > 0) {
-            tokenTimes.push(now)
-            outputTokens++
-            continue
-          }
+    // Extract queue_wait_ms injected by the proxy
+    const queueWait: number | null = typeof body?.queue_wait_ms === 'number' ? body.queue_wait_ms : null
+    const processingTime: number | null = queueWait !== null ? Math.max(0, e2el - queueWait) : null
 
-          // Backend currently wraps a full non-streaming completion in one SSE frame.
-          // Count tokens from usage when available and synthesize basic timing.
-          if (!countedCompletionPayload && parsed?.choices?.[0]?.message) {
-            countedCompletionPayload = true
-
-            const completionTokens = parsed?.usage?.completion_tokens
-            if (typeof completionTokens === 'number' && completionTokens > 0) {
-              outputTokens += completionTokens
-              if (completionTokens > 1 && ttft !== null) {
-                const step = Math.max(1, (now - start - ttft) / (completionTokens - 1))
-                for (let i = 0; i < completionTokens; i++) tokenTimes.push((start + ttft) + i * step)
-              } else {
-                tokenTimes.push(now)
-              }
-            } else {
-              const messageContent = parsed?.choices?.[0]?.message?.content
-              const text = typeof messageContent === 'string' ? messageContent.trim() : ''
-              const approxTokens = text ? Math.max(1, text.split(/\s+/).length) : 1
-              outputTokens += approxTokens
-              tokenTimes.push(now)
-            }
-          }
-        } catch {}
-      }
-      if (doneSeen) {
-        try { await reader.cancel() } catch {}
-        break
-      }
+    // Extract token count from usage
+    let outputTokens = 0
+    const completionTokens = body?.usage?.completion_tokens
+    if (typeof completionTokens === 'number' && completionTokens > 0) {
+      outputTokens = completionTokens
+    } else {
+      const messageContent = body?.choices?.[0]?.message?.content
+      const text = typeof messageContent === 'string' ? messageContent.trim() : ''
+      outputTokens = text ? Math.max(1, text.split(/\s+/).length) : 0
     }
+
+    // Check for error in body
+    if (body?.error || body?.detail) {
+      const errMsg = body?.detail ?? body?.message ?? body?.error
+      return { queueWait, processingTime, e2el, outputTokens, error: String(errMsg), sampleError: String(errMsg) }
+    }
+
+    return { queueWait, processingTime, e2el, outputTokens, error: null }
   } catch (err: unknown) {
     if ((err as any)?.name === 'AbortError') {
-      if (signal.aborted) return { ttft: null, itl: [], e2el: 0, outputTokens: 0, error: 'aborted' }
-      return { ttft, itl: [], e2el: performance.now() - start, outputTokens, error: 'timeout', sampleError: `Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s` }
+      if (signal.aborted) return { queueWait: null, processingTime: null, e2el: 0, outputTokens: 0, error: 'aborted' }
+      return { queueWait: null, processingTime: null, e2el: performance.now() - start, outputTokens: 0, error: 'timeout', sampleError: `Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s` }
     }
     const msg = String(err)
     console.error('[StressTest] runRequest threw:', err)
-    return { ttft: null, itl: [], e2el: performance.now() - start, outputTokens: 0, error: msg, sampleError: msg }
+    return { queueWait: null, processingTime: null, e2el: performance.now() - start, outputTokens: 0, error: msg, sampleError: msg }
   } finally {
     window.clearTimeout(timeoutId)
     signal.removeEventListener('abort', onExternalAbort)
   }
-
-  const e2el = performance.now() - start
-  if (ttft === null && !signal.aborted) ttft = e2el
-  const itl: number[] = []
-  for (let i = 1; i < tokenTimes.length; i++) itl.push(tokenTimes[i] - tokenTimes[i - 1])
-
-  return { ttft, itl, e2el, outputTokens, error: null }
 }
 
 // ── Concurrency pool ──────────────────────────────────────────────────────────
@@ -204,8 +156,8 @@ async function runPool(
       const result = await new Promise<RequestResult>((resolve) => {
         const timer = window.setTimeout(() => {
           resolve({
-            ttft: null,
-            itl: [],
+            queueWait: null,
+            processingTime: null,
             e2el: taskTimeoutMs,
             outputTokens: 0,
             error: 'timeout',
@@ -217,8 +169,8 @@ async function runPool(
           .then((r) => resolve(r))
           .catch((err: unknown) => {
             resolve({
-              ttft: null,
-              itl: [],
+              queueWait: null,
+              processingTime: null,
               e2el: 0,
               outputTokens: 0,
               error: String(err),
@@ -241,8 +193,8 @@ async function runPool(
 interface LiveStats {
   done: number
   errors: number
-  ttfts: number[]
-  itls: number[]
+  queueWaits: number[]
+  processingTimes: number[]
   e2els: number[]
   totalOutputTokens: number
   wallStart: number
@@ -253,8 +205,8 @@ interface LiveStats {
 function computeMetrics(s: LiveStats) {
   const elapsed = ((s.wallEnd ?? performance.now()) - s.wallStart) / 1000  // seconds
   return {
-    ttft: aggStats(s.ttfts),
-    itl: aggStats(s.itls),
+    queueWait: aggStats(s.queueWaits),
+    processingTime: aggStats(s.processingTimes),
     e2el: aggStats(s.e2els),
     rps: s.done / (elapsed || 1),
     tps: s.totalOutputTokens / (elapsed || 1),
@@ -324,6 +276,7 @@ export default function StressTest() {
   const [progress, setProgress] = useState(0)
   const [liveStats, setLiveStats] = useState<LiveStats | null>(null)
   const [preflight, setPreflight] = useState<{ ok: boolean; msg: string } | null>(null)
+  const [queueDepth, setQueueDepth] = useState<number | null>(null)
   const abortRef = useRef<AbortController | null>(null)
 
   const selectedInstance = instances.find((i) => i.slug === selectedSlug)
@@ -332,6 +285,27 @@ export default function StressTest() {
   const conc = Math.min(parseInt(concurrency, 10) || 10, total)
   const maxTok = parseInt(maxTokens, 10) || 128
   const tokenMissing = !rawToken.trim()
+
+  // Poll queue depth while running
+  useEffect(() => {
+    if (!running || !selectedInstance) {
+      setQueueDepth(null)
+      return
+    }
+    let cancelled = false
+    const poll = async () => {
+      try {
+        const data = await queueApi.allDepths()
+        if (!cancelled) {
+          const entry = data.find((d) => d.instance_id === selectedInstance.id)
+          setQueueDepth(entry?.depth ?? null)
+        }
+      } catch {}
+    }
+    poll()
+    const interval = window.setInterval(poll, QUEUE_POLL_INTERVAL_MS)
+    return () => { cancelled = true; window.clearInterval(interval) }
+  }, [running, selectedInstance])
 
   const handleRun = useCallback(async () => {
     if (!selectedSlug || !selectedInstance || !rawToken.trim()) return
@@ -386,7 +360,7 @@ export default function StressTest() {
     const wallStart = performance.now()
     const stats: LiveStats = {
       done: 0, errors: 0,
-      ttfts: [], itls: [], e2els: [],
+      queueWaits: [], processingTimes: [], e2els: [],
       totalOutputTokens: 0,
       wallStart, wallEnd: null,
       sampleError: null,
@@ -410,8 +384,8 @@ export default function StressTest() {
             stats.errors++
             if (!stats.sampleError && result.sampleError) stats.sampleError = result.sampleError
           } else if (!result.error) {
-            if (result.ttft !== null) stats.ttfts.push(result.ttft)
-            stats.itls.push(...result.itl)
+            if (result.queueWait !== null) stats.queueWaits.push(result.queueWait)
+            if (result.processingTime !== null) stats.processingTimes.push(result.processingTime)
             stats.totalOutputTokens += result.outputTokens
           }
           stats.done = done
@@ -445,7 +419,7 @@ export default function StressTest() {
     <div className="p-8 max-w-5xl">
       <h1 className="font-heading font-[800] text-2xl text-white mb-1">Stress Test</h1>
       <p className="text-sm text-gray-500 font-sans font-[200] mb-8">
-        Measure TTFT, ITL, E2E latency, RPS, TPS, tail latency and error rate under load.
+        Measure queue wait, processing time, E2E latency, RPS, TPS and error rate under load.
       </p>
 
       {/* Config */}
@@ -554,7 +528,12 @@ export default function StressTest() {
         <div className="mb-6">
           <div className="flex justify-between text-xs font-mono text-gray-500 mb-1">
             <span>{liveStats?.done ?? 0} / {total} requests</span>
-            <span>{progress}%</span>
+            <span className="flex items-center gap-3">
+              {running && queueDepth !== null && (
+                <span className="text-indigo-400">Queue depth: {queueDepth}</span>
+              )}
+              <span>{progress}%</span>
+            </span>
           </div>
           <div className="w-full bg-gray-800 rounded-full h-2">
             <div
@@ -614,12 +593,12 @@ export default function StressTest() {
           {/* Latency cards */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
             <StatCard
-              label="Time to First Token (TTFT)"
-              stats={metrics.ttft}
+              label="Queue Wait Time"
+              stats={metrics.queueWait}
             />
             <StatCard
-              label="Inter-Token Latency (ITL)"
-              stats={metrics.itl}
+              label="Processing Time"
+              stats={metrics.processingTime}
             />
             <StatCard
               label="End-to-End Latency (E2EL)"
@@ -644,8 +623,8 @@ export default function StressTest() {
                 </thead>
                 <tbody>
                   {([
-                    ['TTFT', metrics.ttft],
-                    ['ITL', metrics.itl],
+                    ['Queue Wait', metrics.queueWait],
+                    ['Processing', metrics.processingTime],
                     ['E2EL', metrics.e2el],
                   ] as [string, AggStats][]).map(([name, s]) => (
                     <tr key={name} className="border-b border-gray-800/50">
@@ -661,9 +640,9 @@ export default function StressTest() {
               </table>
             </div>
             <div className="mt-3 pt-3 border-t border-gray-800 flex flex-wrap gap-x-6 gap-y-1 text-[10px] font-mono text-gray-600">
-              <span>TTFT — Time to First Token: latency before generation starts</span>
-              <span>ITL — Inter-Token Latency: time between consecutive generated tokens</span>
-              <span>E2EL — End-to-End Latency: total request time</span>
+              <span>Queue Wait — time spent in Redis queue before worker picks up the job</span>
+              <span>Processing — actual vLLM inference time (E2EL minus queue wait)</span>
+              <span>E2EL — End-to-End Latency: total request time including queue</span>
               <span className="text-yellow-700">P95 / P99 = tail latency (slowest 5% / 1%)</span>
             </div>
           </div>

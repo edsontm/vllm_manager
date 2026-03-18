@@ -56,6 +56,7 @@ class ContextLengthSuggestion(BaseModel):
 
 class MetricPoint(BaseModel):
     timestamp: datetime
+    count: int = 0
     tokens_per_second: float | None = None
     avg_latency_ms: float | None = None
     queue_depth: int = 0

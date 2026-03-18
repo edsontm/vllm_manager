@@ -132,6 +132,13 @@ def _set_extra_arg(extra_args: dict[str, str], flag_name: str, value: str) -> No
     extra_args[f"--{wanted}"] = value
 
 
+def _remove_extra_arg(extra_args: dict[str, str], flag_name: str) -> None:
+    wanted = _normalize_flag_name(flag_name)
+    for key in list(extra_args.keys()):
+        if _normalize_flag_name(str(key)) == wanted:
+            extra_args.pop(key, None)
+
+
 def _looks_like_gguf_model(model_id: str, extra_args: dict[str, str]) -> bool:
     lowered = model_id.lower()
     if lowered.endswith(".gguf"):
@@ -139,6 +146,20 @@ def _looks_like_gguf_model(model_id: str, extra_args: dict[str, str]) -> bool:
     if "gguf" in lowered.split("/")[-1]:
         return True
     return (_get_extra_arg(extra_args, "load-format") or "").lower() == "gguf"
+
+
+def _is_gemma_3_model(model_id: str) -> bool:
+    lowered = model_id.lower()
+    if "gemma-3" in lowered:
+        return True
+    tail = lowered.split("/")[-1]
+    return tail.startswith("gemma3")
+
+
+def _default_max_model_len_for_model(model_id: str) -> int | None:
+    if _is_gemma_3_model(model_id):
+        return 8192
+    return None
 
 
 def _extract_base_model_candidates_from_card_data(card_data: object) -> list[str]:
@@ -277,11 +298,53 @@ def _apply_startup_stability_defaults(raw_extra_args: dict[str, str] | None) -> 
     if _get_extra_arg(extra_args, "enable-prefix-caching") is None:
         _set_extra_arg(extra_args, "enable-prefix-caching", "true")
 
-    # Reduce KV-cache memory footprint by default.
-    if _get_extra_arg(extra_args, "kv-cache-dtype") is None:
-        _set_extra_arg(extra_args, "kv-cache-dtype", "fp8")
+    return extra_args
+
+
+def _apply_model_compatibility_defaults(
+    model_id: str,
+    raw_extra_args: dict[str, str] | None,
+    *,
+    user_extra_args: dict[str, str] | None = None,
+) -> dict[str, str]:
+    extra_args: dict[str, str] = dict(raw_extra_args or {})
+    if not _is_gemma_3_model(model_id):
+        return extra_args
+
+    kv_cache_dtype = (_get_extra_arg(extra_args, "kv-cache-dtype") or "").strip().lower()
+    if kv_cache_dtype == "fp8":
+        _set_extra_arg(extra_args, "kv-cache-dtype", "auto")
+
+    enforce_eager = (_get_extra_arg(extra_args, "enforce-eager") or "").strip().lower()
+    user_enforce_eager = _get_extra_arg(dict(user_extra_args or {}), "enforce-eager")
+    if enforce_eager == "true" and user_enforce_eager is None:
+        _remove_extra_arg(extra_args, "enforce-eager")
 
     return extra_args
+
+
+def _apply_creation_time_model_profile(
+    model_id: str,
+    *,
+    max_model_len: int | None,
+    raw_extra_args: dict[str, str] | None,
+) -> tuple[int | None, dict[str, str]]:
+    effective_max_model_len = max_model_len
+    extra_args: dict[str, str] = dict(raw_extra_args or {})
+
+    if not _is_gemma_3_model(model_id):
+        return effective_max_model_len, extra_args
+
+    if effective_max_model_len is None:
+        effective_max_model_len = _default_max_model_len_for_model(model_id)
+
+    extra_args = _apply_startup_stability_defaults(extra_args)
+    extra_args = _apply_model_compatibility_defaults(
+        model_id,
+        extra_args,
+        user_extra_args=raw_extra_args,
+    )
+    return effective_max_model_len, extra_args
 
 
 def _extract_repo_id_for_gguf_reference(model_id: str) -> str | None:
@@ -377,18 +440,33 @@ def _build_vllm_args(
     args = [model_ref or instance.model_id, "--host", "0.0.0.0", "--port", str(instance.internal_port)]
     args += ["--tensor-parallel-size", str(instance.tensor_parallel_size)]
     args += ["--gpu-memory-utilization", str(instance.gpu_memory_utilization)]
-    if instance.max_model_len:
-        args += ["--max-model-len", str(instance.max_model_len)]
+    effective_max_model_len = instance.max_model_len
+    if effective_max_model_len is None:
+        effective_max_model_len = _default_max_model_len_for_model(instance.model_id)
+    if effective_max_model_len:
+        args += ["--max-model-len", str(effective_max_model_len)]
     if instance.quantization:
         args += ["--quantization", instance.quantization]
     args += ["--dtype", instance.dtype]
     effective_extra_args = extra_args if extra_args is not None else (instance.extra_args or {})
     if effective_extra_args:
         for k, v in effective_extra_args.items():
+            if v is None:
+                args.append(k)
+                continue
+
+            lowered = str(v).strip().lower()
+            # Boolean flags with true-ish values are sent as stand-alone switches.
+            if lowered in ("true", "", "1", "yes"):
+                args.append(k)
+                continue
+
+            # False-ish values disable the flag and should not be emitted.
+            if lowered in ("false", "0", "no"):
+                continue
+
             args.append(k)
-            # Boolean flags (value is true/True/null/"") have no positional arg
-            if v is not None and str(v).lower() not in ("true", "", "1", "yes"):
-                args.append(str(v))
+            args.append(str(v))
     return args
 
 
@@ -487,19 +565,24 @@ async def create_instance(db: AsyncSession, body: InstanceCreate) -> VllmInstanc
         raise ConflictError(f"Instance slug '{body.slug}' already exists")
 
     port = await allocate_port(db)
+    max_model_len, extra_args = _apply_creation_time_model_profile(
+        body.model_id,
+        max_model_len=body.max_model_len,
+        raw_extra_args=body.extra_args,
+    )
     instance = VllmInstance(
         slug=body.slug,
         display_name=body.display_name,
         model_id=body.model_id,
         internal_port=port,
         gpu_ids=body.gpu_ids,
-        max_model_len=body.max_model_len,
+        max_model_len=max_model_len,
         gpu_memory_utilization=body.gpu_memory_utilization if body.gpu_memory_utilization is not None else 0.9,
         tensor_parallel_size=body.tensor_parallel_size or 1,
         dtype=body.dtype or "auto",
         quantization=body.quantization,
         description=body.description,
-        extra_args=body.extra_args or {},
+        extra_args=extra_args,
         status="stopped",
     )
     db.add(instance)
@@ -510,8 +593,25 @@ async def create_instance(db: AsyncSession, body: InstanceCreate) -> VllmInstanc
 
 async def update_instance(db: AsyncSession, instance_id: int, body: InstanceUpdate) -> VllmInstance:
     instance = await get_instance(db, instance_id)
-    for field, value in body.model_dump(exclude_unset=True).items():
+
+    updates = body.model_dump(exclude_unset=True)
+    next_model_id = updates.get("model_id", instance.model_id)
+    switching_model = "model_id" in updates and next_model_id != instance.model_id
+
+    if switching_model:
+        candidate_max_model_len = updates.get("max_model_len", instance.max_model_len)
+        candidate_extra_args = updates.get("extra_args", instance.extra_args)
+        profiled_max_model_len, profiled_extra_args = _apply_creation_time_model_profile(
+            next_model_id,
+            max_model_len=candidate_max_model_len,
+            raw_extra_args=candidate_extra_args,
+        )
+        updates["max_model_len"] = profiled_max_model_len
+        updates["extra_args"] = profiled_extra_args
+
+    for field, value in updates.items():
         setattr(instance, field, value)
+
     await db.commit()
     await db.refresh(instance)
     return instance
@@ -519,7 +619,17 @@ async def update_instance(db: AsyncSession, instance_id: int, body: InstanceUpda
 
 async def update_instance_model(db: AsyncSession, instance_id: int, model_id: str) -> VllmInstance:
     instance = await get_instance(db, instance_id)
+
+    profiled_max_model_len, profiled_extra_args = _apply_creation_time_model_profile(
+        model_id,
+        max_model_len=instance.max_model_len,
+        raw_extra_args=instance.extra_args,
+    )
+
     instance.model_id = model_id
+    instance.max_model_len = profiled_max_model_len
+    instance.extra_args = profiled_extra_args
+
     await db.commit()
     await db.refresh(instance)
     return instance
@@ -618,8 +728,14 @@ async def start_instance(db: AsyncSession, instance_id: int) -> VllmInstance:
         container_env["HUGGING_FACE_HUB_TOKEN"] = hf_token
 
     try:
-        prepared_extra_args = _prepare_extra_args_for_model(instance.model_id, instance.extra_args)
+        user_extra_args = dict(instance.extra_args or {})
+        prepared_extra_args = _prepare_extra_args_for_model(instance.model_id, user_extra_args)
         prepared_extra_args = _apply_startup_stability_defaults(prepared_extra_args)
+        prepared_extra_args = _apply_model_compatibility_defaults(
+            instance.model_id,
+            prepared_extra_args,
+            user_extra_args=user_extra_args,
+        )
         model_ref = _prepare_model_reference_for_vllm(instance.model_id, prepared_extra_args)
         vllm_cmd = _build_vllm_args(instance, model_ref=model_ref, extra_args=prepared_extra_args)
         serve_command = " ".join(shlex.quote(part) for part in ["vllm", "serve", *vllm_cmd])

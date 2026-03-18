@@ -66,6 +66,13 @@ async def proxy(
     async with _SessionLocal() as lookup_db:
         instance = await vllm_service.get_instance_by_slug(lookup_db, slug)
 
+    # Reject requests to instances that are not running or starting.
+    if instance.status not in ("running", "starting"):
+        return JSONResponse(
+            status_code=503,
+            content={"error": f"Instance '{slug}' is {instance.status}; not accepting requests"},
+        )
+
     # Validate token scope if token is scoped to specific instances.
     if token.scoped_instance_ids and instance.id not in token.scoped_instance_ids:
         from app.core.exceptions import ForbiddenError
@@ -135,6 +142,11 @@ async def proxy(
 
     status_code = result.get("status_code", 200)
     body_content = result.get("body", {})
+    queue_wait_ms = result.get("queue_wait_ms")
+
+    # Inject queue_wait_ms into the response body so clients can read it.
+    if isinstance(body_content, dict) and queue_wait_ms is not None:
+        body_content["queue_wait_ms"] = queue_wait_ms
 
     # If the original request asked for streaming, wrap the complete response
     # as a single SSE event so clients using an EventSource / SSE parser still

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 
 import redis.asyncio as aioredis
@@ -30,6 +31,7 @@ def _result_channel(job_id: str) -> str:
 async def enqueue(instance_id: int, payload: dict, redis: aioredis.Redis) -> tuple[str, int]:
     job_id = payload.get("job_id") or str(uuid.uuid4())
     payload["job_id"] = job_id
+    payload["enqueue_time"] = time.time()
     priority_role = _normalize_priority_role(payload.get("queue_priority_role"))
     await redis.lpush(_queue_key(instance_id, priority_role), json.dumps(payload))
     depths = await redis.pipeline().llen(_queue_key(instance_id, "high_priority")).llen(
@@ -82,6 +84,31 @@ async def get_all_depths(instance_ids: list[int], redis: aioredis.Redis) -> dict
         grouped[iid] = sum(results[idx : idx + len(PRIORITY_ORDER)])
         idx += len(PRIORITY_ORDER)
     return grouped
+
+
+async def peek_jobs(instance_id: int, limit: int, redis: aioredis.Redis) -> list[dict]:
+    """Peek at the most recent jobs in the queue without removing them."""
+    jobs: list[dict] = []
+    for key in _queue_keys_by_priority(instance_id):
+        raw_items = await redis.lrange(key, 0, -1)
+        for raw in raw_items:
+            job = json.loads(raw)
+            job["_priority"] = key.rsplit(":", 1)[-1]
+            jobs.append(job)
+    jobs.sort(key=lambda j: j.get("enqueue_time", 0), reverse=True)
+    return jobs[:limit]
+
+
+async def drain_all(instance_id: int, redis: aioredis.Redis) -> list[dict]:
+    """Non-blocking drain of all jobs from an instance's priority queues."""
+    jobs: list[dict] = []
+    for key in _queue_keys_by_priority(instance_id):
+        while True:
+            raw = await redis.rpop(key)
+            if raw is None:
+                break
+            jobs.append(json.loads(raw))
+    return jobs
 
 
 async def publish_result(job_id: str, result: dict, redis: aioredis.Redis) -> None:

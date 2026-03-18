@@ -2,10 +2,11 @@ import { useEffect, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { instancesApi, type InstanceRead, type InstanceCreate } from '@/api/instancesApi'
-import { metricsApi, type GpuInfo, type InstanceMetrics } from '@/api/metricsApi'
+import { metricsApi, type GpuInfo, type InstanceMetrics, type MetricPoint } from '@/api/metricsApi'
 import { useAuthStore } from '@/store'
 import CodeExample from '@/components/CodeExample'
 import { Play, Square, RefreshCw, Trash2, Plus, ChevronDown, Pencil, Cpu, FileText } from 'lucide-react'
+import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts'
 
 const toGb = (mb: number) => (mb / 1024).toFixed(1)
 
@@ -23,55 +24,6 @@ function ResourceBar({ used, total, label }: { used: number; total: number; labe
       <span className="font-mono text-[10px] text-gray-400 whitespace-nowrap">
         {toGb(used)} / {toGb(safeTotal)} GB <span className="text-gray-600">({pct}%)</span>
       </span>
-    </div>
-  )
-}
-
-function InstanceUsageBar({ used, total, label }: { used: number; total?: number | null; label: string }) {
-  const safeTotal = total != null && total > 0 ? total : used
-  const pct = safeTotal > 0 ? Math.min(100, Math.round((used / safeTotal) * 100)) : 0
-  const color = pct > 90 ? 'bg-red-500' : pct > 70 ? 'bg-yellow-500' : 'bg-cyan-500'
-
-  return (
-    <div className="bg-gray-950/60 border border-gray-800 rounded-lg px-3 py-2 space-y-1.5">
-      <div className="flex items-center justify-between gap-3">
-        <span className="font-mono text-[10px] text-gray-500 uppercase">{label}</span>
-        <span className="font-mono text-[10px] text-gray-300 whitespace-nowrap">
-          {toGb(used)} / {toGb(safeTotal)} GB <span className="text-gray-600">({pct}%)</span>
-        </span>
-      </div>
-      <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
-        <div className={`h-full rounded-full transition-all duration-700 ${color}`} style={{ width: `${pct}%` }} />
-      </div>
-    </div>
-  )
-}
-
-function InstanceGpuBreakdown({
-  hostGpus,
-  memoryByGpuIndex,
-}: {
-  hostGpus: GpuInfo[]
-  memoryByGpuIndex?: Record<string, number> | null
-}) {
-  if (!hostGpus.length) return null
-
-  return (
-    <div className="space-y-2">
-      <p className="font-mono text-[10px] text-gray-500 uppercase">Instance GPU Consumption</p>
-      {hostGpus.map((gpu) => {
-        const byStringKey = memoryByGpuIndex?.[String(gpu.index)]
-        const byNumberKey = memoryByGpuIndex?.[gpu.index as unknown as keyof Record<string, number>]
-        const used = byStringKey ?? byNumberKey ?? 0
-        return (
-          <ResourceBar
-            key={gpu.index}
-            used={used}
-            total={gpu.memory_total_mb}
-            label={`GPU ${gpu.index}`}
-          />
-        )
-      })}
     </div>
   )
 }
@@ -189,6 +141,26 @@ function ResourceSummaryPanel({
             <p className="text-xs text-gray-600">System RAM metrics unavailable.</p>
           )}
         </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Instance VRAM bar ─────────────────────────────────────────────────────────
+
+function MachineGpuUsage({ gpus }: { gpus: GpuInfo[] }) {
+  if (gpus.length === 0) return null
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-[10px] text-gray-500 uppercase">Machine GPU VRAM</span>
+        <span className="font-mono text-[10px] text-gray-600">
+          {gpus.length} GPU{gpus.length === 1 ? '' : 's'} available
+        </span>
+      </div>
+      <div className="flex flex-wrap gap-3">
+        {gpus.map((gpu) => <GpuBar key={gpu.index} gpu={gpu} />)}
       </div>
     </div>
   )
@@ -479,9 +451,70 @@ const STATUS_COLOR: Record<string, string> = {
   pulling: 'text-blue-400',
 }
 
+// ── Requests chart ────────────────────────────────────────────────────────────
+
+function RequestsChart({ instanceId }: { instanceId: number }) {
+  const { data: history = [] } = useQuery<MetricPoint[]>({
+    queryKey: ['metrics-history', instanceId],
+    queryFn: () => metricsApi.history(instanceId),
+    refetchInterval: 60_000,
+    retry: false,
+  })
+
+  const chartData = history.map((p) => ({
+    time: new Date(p.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    count: p.count,
+  }))
+
+  if (chartData.length === 0) {
+    return (
+      <div className="bg-gray-950 border border-gray-800 rounded-lg p-3 h-[120px] flex items-center justify-center">
+        <span className="text-[11px] font-mono text-gray-600">No request data (last 6h)</span>
+      </div>
+    )
+  }
+
+  return (
+    <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
+      <span className="text-[10px] font-mono text-gray-500 uppercase mb-1 block">Requests (15 min buckets, last 6h)</span>
+      <ResponsiveContainer width="100%" height={120}>
+        <AreaChart data={chartData} margin={{ top: 4, right: 4, bottom: 0, left: -20 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
+          <XAxis
+            dataKey="time"
+            tick={{ fontSize: 10, fill: '#6b7280' }}
+            tickLine={false}
+            axisLine={{ stroke: '#374151' }}
+          />
+          <YAxis
+            allowDecimals={false}
+            tick={{ fontSize: 10, fill: '#6b7280' }}
+            tickLine={false}
+            axisLine={{ stroke: '#374151' }}
+          />
+          <Tooltip
+            contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 8, fontSize: 11 }}
+            labelStyle={{ color: '#9ca3af' }}
+            itemStyle={{ color: '#818cf8' }}
+          />
+          <Area
+            type="monotone"
+            dataKey="count"
+            name="Requests"
+            stroke="#6366f1"
+            fill="#6366f1"
+            fillOpacity={0.15}
+            strokeWidth={2}
+          />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+
 // ── Instance row ──────────────────────────────────────────────────────────────
 
-function InstanceRow({ instance, metrics, hostGpus = [] }: { instance: InstanceRead; metrics?: InstanceMetrics; hostGpus?: GpuInfo[] }) {
+function InstanceRow({ instance, metrics, machineGpus = [] }: { instance: InstanceRead; metrics?: InstanceMetrics; machineGpus?: GpuInfo[] }) {
   const qc = useQueryClient()
   const isAdmin = useAuthStore((s) => s.currentUser?.role === 'admin')
   const [showExamples, setShowExamples] = useState(false)
@@ -562,28 +595,21 @@ function InstanceRow({ instance, metrics, hostGpus = [] }: { instance: InstanceR
         )}
       </div>
 
-      {/* Per-instance live resource usage */}
-      {instance.status === 'running' && metrics?.gpu_memory_used_mb != null && (
-        <InstanceUsageBar
-          used={metrics.gpu_memory_used_mb}
-          total={metrics.gpu_memory_total_mb}
-          label="Instance VRAM"
-        />
+      {/* VRAM bar (running instances with live data) */}
+      {instance.status === 'running' && metrics?.gpu_memory_used_mb != null && metrics?.gpu_memory_total_mb != null && (
+        <ResourceBar used={metrics.gpu_memory_used_mb} total={metrics.gpu_memory_total_mb} label="Observed VRAM" />
       )}
 
-      {instance.status === 'running' && metrics?.system_memory_used_mb != null && (
-        <InstanceUsageBar
-          used={metrics.system_memory_used_mb}
-          total={metrics.system_memory_total_mb}
-          label="Instance RAM"
-        />
+      {instance.status === 'running' && metrics?.system_memory_used_mb != null && metrics?.system_memory_total_mb != null && (
+        <ResourceBar used={metrics.system_memory_used_mb} total={metrics.system_memory_total_mb} label="Container RAM" />
+      )}
+
+      {instance.status === 'running' && machineGpus.length > 0 && (
+        <MachineGpuUsage gpus={machineGpus} />
       )}
 
       {instance.status === 'running' && (
-        <InstanceGpuBreakdown
-          hostGpus={hostGpus}
-          memoryByGpuIndex={metrics?.gpu_memory_by_index_mb}
-        />
+        <RequestsChart instanceId={instance.id} />
       )}
 
       {/* Error message from crashed container */}
@@ -767,7 +793,7 @@ export default function Instances() {
               key={inst.id}
               instance={inst}
               metrics={metricsById[inst.id]}
-              hostGpus={gpuSummary?.gpus ?? []}
+              machineGpus={gpuSummary?.gpus ?? []}
             />
           ))}
         </div>

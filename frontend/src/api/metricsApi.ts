@@ -48,6 +48,12 @@ export interface ContextLengthSuggestion {
   suggested_value: number | null
 }
 
+export interface MetricPoint {
+  timestamp: string
+  count: number
+  avg_latency_ms: number | null
+}
+
 export const metricsApi = {
   gpus: async (): Promise<GpuSummary> => {
     const { data } = await api.get<GpuSummary>('/metrics/gpus')
@@ -65,8 +71,8 @@ export const metricsApi = {
     const { data } = await api.get<ContextLengthSuggestion>(`/metrics/${id}/context-suggestion`)
     return data
   },
-  history: async (id: number): Promise<unknown[]> => {
-    const { data } = await api.get<unknown[]>(`/metrics/${id}/history`)
+  history: async (id: number): Promise<MetricPoint[]> => {
+    const { data } = await api.get<MetricPoint[]>(`/metrics/${id}/history`)
     return data
   },
 }

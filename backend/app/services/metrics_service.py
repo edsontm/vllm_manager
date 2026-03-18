@@ -531,26 +531,35 @@ async def get_context_suggestion(
 
 
 async def get_history(db: AsyncSession, instance_id: int) -> list[MetricPoint]:
-    """Return per-hour bucketed metrics for the past 24 hours."""
-    one_day_ago = datetime.now(timezone.utc) - timedelta(hours=24)
+    """Return 15-minute bucketed metrics for the past 6 hours."""
+    from sqlalchemy import text
+
+    six_hours_ago = datetime.now(timezone.utc) - timedelta(hours=6)
+
+    bucket = (
+        func.date_trunc("hour", RequestLog.created_at)
+        + func.floor(func.extract("minute", RequestLog.created_at) / 15)
+        * text("interval '15 minutes'")
+    ).label("bucket")
 
     result = await db.execute(
         select(
-            func.date_trunc("hour", RequestLog.created_at).label("hour"),
+            bucket,
             func.avg(RequestLog.latency_ms).label("avg_latency"),
             func.count(RequestLog.id).label("count"),
         )
         .where(
             RequestLog.instance_id == instance_id,
-            RequestLog.created_at >= one_day_ago,
+            RequestLog.created_at >= six_hours_ago,
         )
-        .group_by("hour")
-        .order_by("hour")
+        .group_by("bucket")
+        .order_by("bucket")
     )
     rows = result.all()
     return [
         MetricPoint(
-            timestamp=row.hour,
+            timestamp=row.bucket,
+            count=row.count,
             avg_latency_ms=float(row.avg_latency) if row.avg_latency else None,
         )
         for row in rows
