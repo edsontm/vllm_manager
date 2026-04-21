@@ -51,6 +51,7 @@ class InstanceRead(BaseModel):
     internal_port: int
     status: str
     error_message: str | None = None
+    warning_message: str | None = None
     gpu_ids: list[int]
     max_model_len: int | None
     gpu_memory_utilization: float

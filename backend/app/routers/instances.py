@@ -78,6 +78,10 @@ async def list_instances(
             raw = await redis.get(f"instance:error:{inst.id}")
             if raw:
                 data.error_message = raw
+        if inst.id:
+            warning = await redis.get(f"instance:warning:{inst.id}")
+            if warning:
+                data.warning_message = warning
         result.append(data)
     return result
 
@@ -96,8 +100,18 @@ async def get_instance(
     instance_id: int,
     _user=Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
+    redis=Depends(get_redis),
 ):
-    return await vllm_service.get_instance(db, instance_id)
+    inst = await vllm_service.get_instance(db, instance_id)
+    data = InstanceRead.model_validate(inst)
+    if inst.status == "error":
+        raw = await redis.get(f"instance:error:{inst.id}")
+        if raw:
+            data.error_message = raw
+    warning = await redis.get(f"instance:warning:{inst.id}")
+    if warning:
+        data.warning_message = warning
+    return data
 
 
 @router.patch("/{instance_id}", response_model=InstanceRead)

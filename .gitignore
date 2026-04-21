@@ -1,3 +1,4 @@
 .env
 docker-compose.resolved.yml
 docker-compose.gpu.yml
+.claude/

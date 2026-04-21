@@ -612,6 +612,14 @@ function InstanceRow({ instance, metrics, machineGpus = [] }: { instance: Instan
         <RequestsChart instanceId={instance.id} />
       )}
 
+      {/* Warning (e.g. capacity planner auto-adjusted max_model_len) */}
+      {instance.warning_message && (
+        <div className="bg-amber-950/40 border border-amber-700/40 rounded-lg p-3 text-[11px] font-mono text-amber-300 whitespace-pre-wrap break-words">
+          <span className="font-sans font-[700] text-amber-200">⚠ Capacity notice:</span>{' '}
+          {instance.warning_message}
+        </div>
+      )}
+
       {/* Error message from crashed container */}
       {instance.status === 'error' && instance.error_message && (
         <div className="space-y-2">

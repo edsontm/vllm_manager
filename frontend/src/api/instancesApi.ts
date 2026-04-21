@@ -9,6 +9,7 @@ export interface InstanceRead {
   internal_port: number
   status: 'stopped' | 'starting' | 'running' | 'error' | 'pulling'
   error_message?: string | null
+  warning_message?: string | null
   gpu_ids: number[]
   max_model_len: number | null
   gpu_memory_utilization: number

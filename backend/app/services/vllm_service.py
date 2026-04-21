@@ -660,6 +660,35 @@ async def _stop_container(instance: VllmInstance) -> None:
         raise VllmError(f"Failed to stop vLLM container: {exc}") from exc
 
 
+def _warning_key(instance_id: int) -> str:
+    return f"instance:warning:{instance_id}"
+
+
+async def _publish_instance_warning(instance_id: int, message: str) -> None:
+    """Publish a non-fatal warning for the UI. Best-effort; failures are ignored."""
+    try:
+        import redis.asyncio as aioredis
+        redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+        try:
+            await redis.setex(_warning_key(instance_id), 86400, message)
+        finally:
+            await redis.aclose()
+    except Exception as exc:
+        logger.debug("warning_publish_failed", instance_id=instance_id, error=str(exc))
+
+
+async def _clear_instance_warning(instance_id: int) -> None:
+    try:
+        import redis.asyncio as aioredis
+        redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+        try:
+            await redis.delete(_warning_key(instance_id))
+        finally:
+            await redis.aclose()
+    except Exception:
+        pass
+
+
 async def start_instance(db: AsyncSession, instance_id: int) -> VllmInstance:
     instance = await get_instance(db, instance_id)
 
@@ -728,6 +757,42 @@ async def start_instance(db: AsyncSession, instance_id: int) -> VllmInstance:
         container_env["HUGGING_FACE_HUB_TOKEN"] = hf_token
 
     try:
+        # ── Capacity check: fit the model into the selected GPU(s) ──────────────
+        from app.services import capacity_service  # local import to avoid cycles
+        from app.models.hf_model import HFModel as _HFModel
+        param_count_b: float | None = None
+        try:
+            cat = (await db.execute(
+                select(_HFModel).where(_HFModel.model_id == instance.model_id)
+            )).scalar_one_or_none()
+            if cat is not None:
+                param_count_b = cat.parameter_count_b
+        except Exception:
+            param_count_b = None
+        plan = capacity_service.compute_plan(
+            model_id=instance.model_id,
+            requested_max_model_len=instance.max_model_len,
+            gpu_memory_utilization=instance.gpu_memory_utilization,
+            gpu_indices=list(instance.gpu_ids or []),
+            dtype=instance.dtype,
+            param_count_b=param_count_b,
+        )
+        if plan.was_adjusted and plan.effective_max_model_len:
+            instance.max_model_len = plan.effective_max_model_len
+            await db.commit()
+            await db.refresh(instance)
+        if plan.warnings:
+            await _publish_instance_warning(instance.id, " ".join(plan.warnings))
+            logger.warning(
+                "instance_capacity_warning",
+                instance_id=instance.id,
+                slug=instance.slug,
+                warnings=plan.warnings,
+                details=plan.details,
+            )
+        else:
+            await _clear_instance_warning(instance.id)
+
         user_extra_args = dict(instance.extra_args or {})
         prepared_extra_args = _prepare_extra_args_for_model(instance.model_id, user_extra_args)
         prepared_extra_args = _apply_startup_stability_defaults(prepared_extra_args)
