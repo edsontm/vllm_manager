@@ -789,6 +789,17 @@ async def start_instance(db: AsyncSession, instance_id: int) -> VllmInstance:
                 param_count_b = cat.parameter_count_b
         except Exception:
             param_count_b = None
+
+        # Parse --cpu-offload-gb from the user's extra_args so the plan
+        # only counts weights that actually stay on GPU.
+        cpu_offload_gb = 0.0
+        try:
+            raw_offload = _get_extra_arg(dict(instance.extra_args or {}), "cpu-offload-gb")
+            if raw_offload is not None:
+                cpu_offload_gb = float(raw_offload)
+        except (TypeError, ValueError):
+            cpu_offload_gb = 0.0
+
         plan = capacity_service.compute_plan(
             model_id=instance.model_id,
             requested_max_model_len=instance.max_model_len,
@@ -796,6 +807,7 @@ async def start_instance(db: AsyncSession, instance_id: int) -> VllmInstance:
             gpu_indices=list(instance.gpu_ids or []),
             dtype=instance.dtype,
             param_count_b=param_count_b,
+            cpu_offload_gb=cpu_offload_gb,
         )
         if plan.was_adjusted and plan.effective_max_model_len:
             instance.max_model_len = plan.effective_max_model_len

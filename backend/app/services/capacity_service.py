@@ -126,6 +126,58 @@ def _kv_bytes_per_token(config: dict | None, param_count_b: float | None, dtype_
     return int(raw * _KV_SAFETY_FACTOR)
 
 
+def _detect_quantization(config: dict | None) -> dict | None:
+    """Read `quantization_config` from config.json and return an effective
+    bits-per-weight + a human-readable method label.
+
+    Handles GPTQ/AWQ (`bits` field), bitsandbytes (`load_in_4bit`,
+    `load_in_8bit`), FP8/INT8 weight-only flags, and the convention used by
+    some NVFP4/NVFP8 repos (`weight_precision`/`num_bits`). Returns None when
+    no quantization is detected.
+    """
+    if not isinstance(config, dict):
+        return None
+
+    qc = config.get("quantization_config")
+    if not isinstance(qc, dict):
+        # Some FP8 repos expose torch_dtype="float8_e4m3fn" without a
+        # quantization_config block.
+        tdt = str(config.get("torch_dtype") or "").lower()
+        if "float8" in tdt or tdt in ("fp8", "e4m3", "e5m2"):
+            return {"bits": 8, "method": "fp8"}
+        return None
+
+    method = str(qc.get("quant_method") or qc.get("method") or "").lower()
+
+    if qc.get("load_in_4bit") is True:
+        return {"bits": 4, "method": method or "bitsandbytes-4bit"}
+    if qc.get("load_in_8bit") is True:
+        return {"bits": 8, "method": method or "bitsandbytes-8bit"}
+
+    # GPTQ/AWQ/compressed-tensors all expose `bits` as an int.
+    for key in ("bits", "num_bits", "weight_bits"):
+        v = qc.get(key)
+        if isinstance(v, int) and v > 0:
+            return {"bits": int(v), "method": method or key}
+
+    # compressed-tensors uses a nested `config_groups` with `num_bits`.
+    groups = qc.get("config_groups")
+    if isinstance(groups, dict):
+        for group in groups.values():
+            if isinstance(group, dict):
+                weights = group.get("weights") or {}
+                if isinstance(weights, dict):
+                    v = weights.get("num_bits")
+                    if isinstance(v, int) and v > 0:
+                        return {"bits": int(v), "method": method or "compressed-tensors"}
+
+    # FP8 without explicit bits (e.g. fbgemm_fp8, fp8_e4m3).
+    if "fp8" in method or "float8" in method:
+        return {"bits": 8, "method": method}
+
+    return None
+
+
 _CONFIG_CACHE: dict[str, dict] = {}
 
 
@@ -148,34 +200,52 @@ def _fetch_model_config(model_id: str) -> dict:
     return {}
 
 
-def _estimate_weights_gb(model_id: str, dtype_str: str, param_count_b: float | None = None) -> float:
-    """Best-effort weights size in GB. Prefers live safetensors totals, falls
-    back to parameter count × bytes-per-elem when the HF API is unreachable."""
+def _bits_per_weight(dtype_str: str, quant: dict | None) -> tuple[float, str]:
+    """Return (bits_per_weight, source_label) honoring detected quantization."""
+    if quant and isinstance(quant.get("bits"), int) and quant["bits"] > 0:
+        return float(quant["bits"]), quant.get("method") or "quant"
+    bytes_per_elem = _BYTES_PER_ELEMENT_BY_DTYPE.get((dtype_str or "").strip().lower(), 2)
+    return 8.0 * bytes_per_elem, f"dtype={dtype_str or 'bf16'}"
+
+
+def _estimate_weights_gb(
+    model_id: str,
+    dtype_str: str,
+    param_count_b: float | None = None,
+    quant: dict | None = None,
+) -> tuple[float, str]:
+    """Best-effort weights size in GB and a label describing the basis.
+
+    Order of preference:
+      1. Live safetensors shard sizes (from the HF file-metadata API).
+      2. `safetensors.total` (parameter-element count) × bytes-per-element
+         derived from quantization bits or the configured dtype.
+      3. Catalog parameter_count_b × bits/8 (when HF API is unreachable).
+    """
+    bits, source = _bits_per_weight(dtype_str, quant)
     try:
         api = hf_service.get_hf_api()
         info = api.model_info(model_id, files_metadata=True)
-        st = getattr(info, "safetensors", None)
-        total = getattr(st, "total", None) if st is not None else None
-        if isinstance(total, (int, float)) and total > 0:
-            bytes_per_elem = _BYTES_PER_ELEMENT_BY_DTYPE.get((dtype_str or "").strip().lower(), 2)
-            return float(total) * bytes_per_elem / (1024 ** 3)
 
         siblings = getattr(info, "siblings", None) or []
         total_bytes = sum(
             getattr(s, "size", 0) or 0
             for s in siblings
-            if getattr(s, "rfilename", "").endswith(".safetensors")
+            if getattr(s, "rfilename", "").endswith((".safetensors", ".gguf", ".bin"))
         )
         if total_bytes > 0:
-            return float(total_bytes) / (1024 ** 3)
+            return float(total_bytes) / (1024 ** 3), "file_bytes"
+
+        st = getattr(info, "safetensors", None)
+        total = getattr(st, "total", None) if st is not None else None
+        if isinstance(total, (int, float)) and total > 0:
+            return float(total) * (bits / 8.0) / (1024 ** 3), f"safetensors.total × {source}"
     except Exception as exc:
         log.debug("capacity_weights_live_probe_failed", model_id=model_id, error=str(exc))
 
-    # Fallback: parameter count × bytes/elem (BF16 default).
     if param_count_b is not None and param_count_b > 0:
-        bytes_per_elem = _BYTES_PER_ELEMENT_BY_DTYPE.get((dtype_str or "").strip().lower(), 2)
-        return float(param_count_b) * 1e9 * bytes_per_elem / (1024 ** 3)
-    return 0.0
+        return float(param_count_b) * 1e9 * (bits / 8.0) / (1024 ** 3), f"param_count × {source}"
+    return 0.0, "unknown"
 
 
 def _model_max_position_embeddings(config: dict) -> int | None:
@@ -195,6 +265,7 @@ def compute_plan(
     gpu_indices: list[int],
     dtype: str = "auto",
     param_count_b: float | None = None,
+    cpu_offload_gb: float = 0.0,
 ) -> CapacityPlan:
     """Decide the feasible max_model_len given the selected hardware.
 
@@ -222,16 +293,37 @@ def compute_plan(
     # Use the configured dtype or fall back to bf16 for KV estimation.
     effective_dtype = dtype if dtype and dtype != "auto" else "bf16"
 
-    weights_gb = _estimate_weights_gb(model_id, effective_dtype, param_count_b)
-    details["weights_gb"] = round(weights_gb, 2)
-    kv_headroom_gb = budget_gb - weights_gb - _WEIGHTS_OVERHEAD_GB
+    # Fetch config early so we can read quantization_config for weight sizing.
+    config = _fetch_model_config(model_id)
+    quant = _detect_quantization(config)
+    if quant:
+        details["quantization"] = {"method": quant["method"], "bits": quant["bits"]}
+
+    full_weights_gb, weights_source = _estimate_weights_gb(
+        model_id, effective_dtype, param_count_b, quant=quant
+    )
+    details["weights_gb"] = round(full_weights_gb, 2)
+    details["weights_source"] = weights_source
+
+    # `--cpu-offload-gb` moves that many GB of weights out of GPU memory;
+    # the capacity plan should see only the resident portion.
+    cpu_offload_gb = max(0.0, float(cpu_offload_gb or 0.0))
+    if cpu_offload_gb > 0:
+        details["cpu_offload_gb"] = round(cpu_offload_gb, 2)
+    resident_weights_gb = max(0.0, full_weights_gb - cpu_offload_gb)
+    details["resident_weights_gb"] = round(resident_weights_gb, 2)
+
+    kv_headroom_gb = budget_gb - resident_weights_gb - _WEIGHTS_OVERHEAD_GB
     details["kv_headroom_gb"] = round(kv_headroom_gb, 2)
 
-    if weights_gb > 0 and weights_gb >= budget_gb:
+    if resident_weights_gb > 0 and resident_weights_gb >= budget_gb:
+        extra = (
+            f" after offloading {cpu_offload_gb:.0f} GB to CPU" if cpu_offload_gb > 0 else ""
+        )
         warnings.append(
-            f"Model weights alone (~{weights_gb:.1f} GB) exceed the GPU budget "
-            f"(~{budget_gb:.1f} GB). Consider a smaller model, a quantized variant, "
-            f"or adding more GPUs."
+            f"Model weights on GPU (~{resident_weights_gb:.1f} GB{extra}) exceed "
+            f"the GPU budget (~{budget_gb:.1f} GB). Increase --cpu-offload-gb, pick "
+            f"a smaller/lower-bit quantization, or add more GPUs."
         )
         return CapacityPlan(
             effective_max_model_len=requested_max_model_len,
@@ -240,7 +332,6 @@ def compute_plan(
             details=details,
         )
 
-    config = _fetch_model_config(model_id)
     model_native_max = _model_max_position_embeddings(config)
     details["model_native_max"] = model_native_max
 
@@ -258,7 +349,7 @@ def compute_plan(
     if kv_headroom_gb <= 0.1:
         warnings.append(
             f"Almost no KV-cache headroom on the selected GPU(s) after loading "
-            f"weights (~{weights_gb:.1f} GB). You need a larger GPU or a lower "
+            f"weights (~{resident_weights_gb:.1f} GB). You need a larger GPU or a lower "
             f"gpu_memory_utilization on other processes."
         )
         return CapacityPlan(
@@ -287,7 +378,7 @@ def compute_plan(
         warnings.append(
             f"The selected GPU(s) ({total_gb:.0f} GB total) can only hold "
             f"~{max_safe_context} tokens of context for '{model_id}' "
-            f"(weights ≈ {weights_gb:.1f} GB). Clamped max_model_len from "
+            f"(weights ≈ {resident_weights_gb:.1f} GB on GPU). Clamped max_model_len from "
             f"{effective_requested} to {max_safe_context}."
         )
         return CapacityPlan(
