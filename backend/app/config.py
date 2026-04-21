@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     # Metrics
     metrics_poll_interval_s: int = 30
 
+    # HuggingFace catalog worker
+    catalog_refresh_interval_s: int = 600  # 10 minutes
+    catalog_popular_limit: int = 500       # top-N by downloads per refresh
+    catalog_per_task_limit: int = 200      # top-N per pipeline task
+    catalog_max_concurrency: int = 8       # parallel model_info fetches
+    catalog_min_results_live_fallback: int = 5  # if catalog returns < N, fall back to live HF
+
     # Bootstrap admin account
     bootstrap_admin_username: str = "admin"
     bootstrap_admin_email: str = "admin@example.com"

@@ -47,12 +47,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro
       - /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:ro
-    devices:
-      - /dev/nvidiactl:/dev/nvidiactl
-      - /dev/nvidia-uvm:/dev/nvidia-uvm
-      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
-      - /dev/nvidia0:/dev/nvidia0
-      - /dev/nvidia1:/dev/nvidia1
+    # NVIDIA devices are injected at runtime by docker-compose.gpu.yml,
+    # generated dynamically by `make gpu-override` based on /dev/nvidia*.
     depends_on:
       postgres:
         condition: service_healthy
@@ -97,6 +93,23 @@ services:
       redis:
         condition: service_healthy
     command: python -m app.workers.metrics_worker
+    networks:
+      - vllm_network
+
+  catalog-worker:
+    build:
+      context: ./backend
+      target: runtime
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - hf_cache:${HF_CACHE_DIR:-/home/vllm/.cache/huggingface}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    command: python -m app.workers.catalog_worker
     networks:
       - vllm_network
 

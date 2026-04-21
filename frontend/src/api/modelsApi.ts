@@ -37,6 +37,12 @@ export interface SwitchModelRequest {
   model_id: string
 }
 
+export interface CatalogStatus {
+  total_models: number
+  compatible_models: number
+  last_refreshed_at: string | null
+}
+
 export const modelsApi = {
   available: async (query = '', limit = 20, sort = 'downloads', task = 'all'): Promise<HFModelInfo[]> => {
     const { data } = await api.get<HFModelInfo[]>('/models/available', { params: { query, limit, sort, task } })
@@ -60,4 +66,11 @@ export const modelsApi = {
     await api.post(`/models/switch/${instanceId}`, { model_id: modelId })
   },
   updateWeightsUrl: (instanceId: number) => `/api/models/update/${instanceId}`,
+  catalogStatus: async (): Promise<CatalogStatus> => {
+    const { data } = await api.get<CatalogStatus>('/models/catalog/status')
+    return data
+  },
+  catalogRefresh: async (): Promise<void> => {
+    await api.post('/models/catalog/refresh')
+  },
 }

@@ -322,6 +322,39 @@ def _matches_compatibility_override(info: object) -> bool:
     return False
 
 
+def is_model_compatible(info: object, api: HfApi | None = None, tokenizer_repo_cache: dict[str, bool] | None = None) -> bool:
+    """Public wrapper for the compatibility check, used by the catalog refresher."""
+    return _is_model_compatible(info, api or _get_api(), tokenizer_repo_cache if tokenizer_repo_cache is not None else {})
+
+
+def hf_info_to_schema(info: object) -> "HFModelInfo":
+    """Map a HuggingFace ModelInfo object to our HFModelInfo schema."""
+    return HFModelInfo(
+        model_id=info.id,
+        author=getattr(info, "author", None),
+        pipeline_tag=getattr(info, "pipeline_tag", None),
+        downloads=getattr(info, "downloads", 0) or 0,
+        likes=getattr(info, "likes", 0) or 0,
+        tags=list(getattr(info, "tags", None) or []),
+        last_modified=str(info.last_modified) if getattr(info, "last_modified", None) else None,
+        parameter_count_b=_estimate_parameter_count_b(
+            getattr(info, "siblings", None),
+            info.id,
+            getattr(info, "safetensors", None),
+        ),
+        vram_required_gb=(
+            _estimate_vram_gb(getattr(info, "siblings", None))
+            or _estimate_vram_from_name(info.id)
+        ),
+        supports_image=_is_multimodal(info),
+        capabilities=_infer_capabilities(info),
+    )
+
+
+def get_hf_api() -> HfApi:
+    return _get_api()
+
+
 def _is_model_compatible(info: object, api: HfApi, tokenizer_repo_cache: dict[str, bool]) -> bool:
     # Primary check: use architectures from config.json to match against vLLM whitelist.
     model_config = getattr(info, "config", None) or {}
@@ -348,62 +381,100 @@ def _is_model_compatible(info: object, api: HfApi, tokenizer_repo_cache: dict[st
     return False
 
 
+async def list_models_live(
+    query: str = "",
+    limit: int = 20,
+    sort: str = "downloads",
+    task: str = "all",
+) -> tuple[list[HFModelInfo], dict[str, bool]]:
+    """Bypass the catalog and hit HuggingFace directly. Returns (schemas, compat_map).
+
+    Parallelizes the per-model metadata fetch with a bounded thread pool instead
+    of the original sequential loop.
+    """
+    import asyncio
+
+    task_filter = task.strip().lower() if task else "all"
+    api = _get_api()
+    loop = asyncio.get_running_loop()
+
+    try:
+        stubs = await loop.run_in_executor(None, lambda: list(api.list_models(
+            search=query or None,
+            task=None if task_filter == "all" else task_filter,
+            limit=limit,
+            sort=sort if sort in ("downloads", "trending", "likes", "created_at") else "downloads",
+        )))
+    except HfHubHTTPError as exc:
+        raise HuggingFaceError(str(exc)) from exc
+
+    sem = asyncio.Semaphore(max(1, settings.catalog_max_concurrency))
+
+    async def _info(mid: str):
+        async with sem:
+            try:
+                return await loop.run_in_executor(None, lambda: api.model_info(mid, files_metadata=True))
+            except HfHubHTTPError:
+                return None
+            except Exception:
+                return None
+
+    infos = await asyncio.gather(*[_info(s.id) for s in stubs])
+
+    tokenizer_repo_cache: dict[str, bool] = {}
+    compatible: list[HFModelInfo] = []
+    compat_map: dict[str, bool] = {}
+
+    for info in infos:
+        if info is None:
+            continue
+        if not _is_model_compatible(info, api, tokenizer_repo_cache):
+            compat_map[info.id] = False
+            continue
+        schema = hf_info_to_schema(info)
+        compatible.append(schema)
+        compat_map[schema.model_id] = True
+
+    return compatible, compat_map
+
+
 async def list_models(
     query: str = "",
     limit: int = 20,
     sort: str = "downloads",
     task: str = "all",
 ) -> list[HFModelInfo]:
-    task_filter = task.strip().lower() if task else "all"
+    """Catalog-first search with live HF fallback when the catalog returns too few results."""
+    import asyncio
+
+    from app.services import hf_catalog_service
+
+    Session = hf_catalog_service._get_session_factory()
     try:
-        models = list(_get_api().list_models(
-            search=query or None,
-            task=None if task_filter == "all" else task_filter,
-            limit=limit,
-            sort=sort if sort in ("downloads", "trending", "likes", "created_at") else "downloads",
-        ))
-    except HfHubHTTPError as exc:
-        raise HuggingFaceError(str(exc)) from exc
-
-    api = _get_api()
-    tokenizer_repo_cache: dict[str, bool] = {}
-    compatible: list[HFModelInfo] = []
-
-    for m in models:
-        try:
-            info = api.model_info(m.id, files_metadata=True)
-        except HfHubHTTPError:
-            continue
-        except Exception:
-            continue
-
-        if not _is_model_compatible(info, api, tokenizer_repo_cache):
-            continue
-
-        compatible.append(
-            HFModelInfo(
-                model_id=info.id,
-                author=info.author,
-                pipeline_tag=info.pipeline_tag,
-                downloads=info.downloads or 0,
-                likes=info.likes or 0,
-                tags=list(info.tags or []),
-                last_modified=str(info.last_modified) if info.last_modified else None,
-                parameter_count_b=_estimate_parameter_count_b(
-                    getattr(info, "siblings", None),
-                    info.id,
-                    getattr(info, "safetensors", None),
-                ),
-                vram_required_gb=(
-                    _estimate_vram_gb(getattr(info, "siblings", None))
-                    or _estimate_vram_from_name(info.id)
-                ),
-                supports_image=_is_multimodal(info),
-                capabilities=_infer_capabilities(info),
+        async with Session() as session:
+            catalog_hits = await hf_catalog_service.search_catalog(
+                session, query=query, limit=limit, sort=sort, task=task
             )
-        )
+    except Exception as exc:
+        logger.warning("catalog_search_failed_falling_back_to_live", error=str(exc))
+        catalog_hits = []
 
-    return compatible
+    if len(catalog_hits) >= settings.catalog_min_results_live_fallback:
+        return catalog_hits
+
+    try:
+        live_hits, compat_map = await list_models_live(query=query, limit=limit, sort=sort, task=task)
+    except Exception as exc:
+        logger.warning("live_search_failed_using_catalog_only", error=str(exc))
+        return catalog_hits
+
+    asyncio.create_task(hf_catalog_service.upsert_from_live_search(
+        [(schema, compat_map.get(schema.model_id, True)) for schema in live_hits]
+    ))
+
+    if len(live_hits) >= len(catalog_hits):
+        return live_hits
+    return catalog_hits
 
 
 async def model_info(model_id: str) -> HFModelInfo:

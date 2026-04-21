@@ -10,9 +10,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_admin_user, get_current_active_user, get_db
 from app.schemas.model import DeployModelRequest, HFModelInfo, LocalModelInfo, ModelPrefill, SwitchModelRequest
-from app.services import hf_service, vllm_service
+from app.services import hf_catalog_service, hf_service, vllm_service
 
 router = APIRouter(prefix="/models", tags=["Models"])
+
+
+@router.get("/catalog/status")
+async def catalog_status(
+    _user=Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return catalog size and timestamp of the last refresh."""
+    return await hf_catalog_service.catalog_status(db)
+
+
+@router.post("/catalog/refresh")
+async def catalog_refresh(_admin=Depends(get_admin_user)):
+    """Kick off a catalog refresh in the background (admin only)."""
+    asyncio.create_task(hf_catalog_service.refresh_catalog())
+    return {"status": "scheduled"}
 
 
 @router.get("/available", response_model=list[HFModelInfo])

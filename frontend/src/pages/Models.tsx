@@ -1,8 +1,8 @@
-import { useState, useMemo } from "react"
+import { useState, useMemo, useEffect } from "react"
 import { useNavigate } from "react-router-dom"
-import { useQuery } from "@tanstack/react-query"
+import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { modelsApi, type HFModelInfo, type LocalModelInfo } from "@/api/modelsApi"
-import { HardDrive, Cpu, Image } from "lucide-react"
+import { HardDrive, Cpu, Image, RefreshCw } from "lucide-react"
 
 // ── types ──────────────────────────────────────────────────────────────────────
 type HubSort = "popularity" | "vram_asc" | "vram_desc"
@@ -193,9 +193,69 @@ function LocalCard({ model }: { model: LocalModelInfo }) {
   )
 }
 
+function formatRelative(iso: string | null): string {
+  if (!iso) return "never"
+  const then = new Date(iso).getTime()
+  const diff = Math.max(0, Date.now() - then)
+  const s = Math.floor(diff / 1000)
+  if (s < 60) return `${s}s ago`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ago`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h ago`
+  return `${Math.floor(h / 24)}d ago`
+}
+
+function CatalogBadge() {
+  const qc = useQueryClient()
+  const { data } = useQuery({
+    queryKey: ["catalog-status"],
+    queryFn: modelsApi.catalogStatus,
+    refetchInterval: 30_000,
+    staleTime: 20_000,
+  })
+  const [refreshing, setRefreshing] = useState(false)
+  const handleRefresh = async () => {
+    setRefreshing(true)
+    try {
+      await modelsApi.catalogRefresh()
+    } catch { /* admin-only endpoint; ignore 403 */ }
+    setTimeout(() => {
+      qc.invalidateQueries({ queryKey: ["catalog-status"] })
+      qc.invalidateQueries({ queryKey: ["models-hub"] })
+      setRefreshing(false)
+    }, 1500)
+  }
+  const compatible = data?.compatible_models ?? 0
+  const updated = formatRelative(data?.last_refreshed_at ?? null)
+  return (
+    <div className="inline-flex items-center gap-2 text-[11px] font-sans font-[200] text-gray-500">
+      <span>
+        Catalog: <span className="font-mono text-gray-400">{compatible}</span> models ·
+        updated <span className="font-mono text-gray-400">{updated}</span>
+      </span>
+      <button
+        onClick={handleRefresh}
+        disabled={refreshing}
+        className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 disabled:opacity-50"
+        title="Refresh catalog now (admin only)"
+      >
+        <RefreshCw size={10} className={refreshing ? "animate-spin" : ""} />
+        Refresh
+      </button>
+    </div>
+  )
+}
+
 export default function Models() {
   const [search, setSearch] = useState("")
+  const [debouncedSearch, setDebouncedSearch] = useState("")
   const [activeTab, setActiveTab] = useState<"hub" | "local">("hub")
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search), 300)
+    return () => clearTimeout(t)
+  }, [search])
 
   // Hub tab controls
   const [hubSort, setHubSort] = useState<HubSort>("popularity")
@@ -214,15 +274,16 @@ export default function Models() {
   const [localVramCeiling, setLocalVramCeiling] = useState<VramCeiling>(null)
 
   const { data: hubModels = [], isLoading: loadingHub } = useQuery({
-    queryKey: ["models-hub", search, hubSort, hubTask],
+    queryKey: ["models-hub", debouncedSearch, hubSort, hubTask],
     queryFn: () =>
       modelsApi.available(
-        search,
+        debouncedSearch,
         50,
         hubSort === "popularity" ? "downloads" : "downloads",
         hubTask === "image" ? "all" : hubTask,
       ),
     enabled: activeTab === "hub",
+    staleTime: 60_000,
   })
 
   const { data: localModels = [], isLoading: loadingLocal } = useQuery({
@@ -312,6 +373,7 @@ export default function Models() {
       {/* ── HF Hub tab ── */}
       {activeTab === "hub" && (
         <>
+          <div className="mb-3"><CatalogBadge /></div>
           <div className="flex flex-wrap gap-3 items-end mb-5">
             <input
               value={search}
