@@ -425,8 +425,28 @@ def _prepare_model_reference_for_vllm(model_id: str, extra_args: dict[str, str])
     if not chosen:
         raise VllmError(f"Could not select a GGUF file from repo '{repo_id}'.")
 
-    resolved = f"{repo_id}/{chosen}"
-    logger.info("gguf_model_reference_resolved", model_id=model_id, resolved_model_id=resolved)
+    # vLLM supports the `repo_id:QUANT_TYPE` form natively (is_remote_gguf),
+    # which lets the vLLM container resolve the GGUF file without any shared
+    # cache between containers. Try to extract a recognizable quant marker
+    # from the chosen filename and emit that form whenever possible.
+    import re as _re
+    quant_marker = None
+    tail = chosen.lower()
+    # Common patterns: -Q4_K_M.gguf, -Q5_K_S.gguf, -IQ3_XS.gguf, -F16.gguf…
+    m = _re.search(r"(?:^|[-_.])(i?q\d+(?:_[a-z0-9]+)*|f16|bf16|f32)(?:\.gguf$|[-_.])", tail)
+    if m:
+        quant_marker = m.group(1).upper()
+    if quant_marker:
+        resolved = f"{repo_id}:{quant_marker}"
+    else:
+        resolved = f"{repo_id}/{chosen}"
+
+    logger.info(
+        "gguf_model_reference_resolved",
+        model_id=model_id,
+        chosen_file=chosen,
+        resolved_model_id=resolved,
+    )
     return resolved
 
 
